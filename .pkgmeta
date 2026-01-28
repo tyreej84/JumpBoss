@@ -1,0 +1,14 @@
+name: JumpBoss
+
+package-as: JumpBoss
+
+# Files/folders that should NOT end up in the packaged zip
+ignore:
+  - .git
+  - .github
+  - .vscode
+  - .idea
+  - .DS_Store
+
+# Use our own changelog instead of auto-generated one
+manual-changelog: CHANGELOG.md

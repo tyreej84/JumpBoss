@@ -2,7 +2,7 @@
 ## Title: JumpBoss
 ## Notes: Tracks jumps during boss encounters (addon users only). Silent comms. Winner posts leaderboard at end.
 ## Author: Karnytine-Stormrage (joe@tyreenet.com)
-## Version: 1.0.0
+## Version: @project-version@
 ## SavedVariables: JumpBossDB
 
 JumpBoss.lua
