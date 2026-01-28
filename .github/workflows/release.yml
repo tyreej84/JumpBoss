@@ -1,0 +1,46 @@
+name: Build Release Zip
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare package folder
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist/JumpBoss
+
+          # Copy addon files into the folder that will be zipped
+          cp -f JumpBoss.toc dist/JumpBoss/JumpBoss.toc
+          cp -f JumpBoss.lua dist/JumpBoss/JumpBoss.lua
+
+          # Include docs at root of zip (optional but nice)
+          if [ -f README.md ]; then cp -f README.md dist/README.md; fi
+          if [ -f CHANGELOG.md ]; then cp -f CHANGELOG.md dist/CHANGELOG.md; fi
+          if [ -f LICENSE.md ]; then cp -f LICENSE.md dist/LICENSE.md; fi
+
+      - name: Create zip
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          ZIP="JumpBoss-${TAG}.zip"
+          (cd dist && zip -r "../${ZIP}" .)
+
+      - name: Create GitHub Release (if missing) and upload asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: JumpBoss-${{ github.ref_name }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
