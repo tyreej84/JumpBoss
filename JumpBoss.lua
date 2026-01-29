@@ -3,16 +3,16 @@
 -- Silent addon comms during encounter, ZERO chat until encounter end.
 -- At end: ONLY the winner posts the leaderboard.
 --
--- Sync Fix:
---  - Broadcast addon messages to BOTH INSTANCE_CHAT and PARTY/RAID as applicable
---    (prevents “no syncing” in some group types)
+-- Live Sync Upgrade:
+--  - Uses BreakTimerLite-style channel selection (INSTANCE -> RAID -> PARTY)
+--  - HELLO / REQ / STATE handshake (supports reloads + late joins)
+--  - Requests state at encounter start and on roster/world changes while active
+--  - Interactive updates throughout the encounter
 --
--- v1.0.7 behavior retained:
---  - Only ONE winner posts (claim arbitration)
---  - Jump counting stops immediately at boss death
---  - Waits ~5 seconds to sync totals, then determines winner
+-- Winner Posting:
+--  - Waits syncWindow seconds after ENCOUNTER_END to collect final totals
+--  - Only one winner posts (claim arbitration + delay)
 --  - Posts at least Top 5 (or fewer if fewer participants)
---  - UI stays visible ~20s after boss death (display only)
 
 local ADDON_NAME = ...
 local PREFIX = "JBT1"
@@ -26,7 +26,7 @@ local DEFAULTS = {
   scale = 1.0,
 
   maxLines = 5,
-  width = 150,
+  width = 160,
   lineHeight = 13,
 
   broadcastInterval = 0.10,
@@ -60,10 +60,10 @@ local function Now() return GetTime() or 0 end
 local function PlayerFullName()
   local name, realm = UnitName("player")
   realm = realm or GetRealmName() or ""
-  if realm ~= "" and not name:find("-") then
+  if realm ~= "" and name and not name:find("-") then
     return name .. "-" .. realm
   end
-  return name
+  return name or ""
 end
 
 local function Clamp(x, a, b)
@@ -72,6 +72,17 @@ local function Clamp(x, a, b)
   return x
 end
 
+-- BreakTimerLite-style: pick ONE correct channel
+local function GetGroupChannel()
+  if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then return "INSTANCE_CHAT" end
+  if IsInRaid() then return "RAID" end
+  if IsInGroup() then return "PARTY" end
+  return nil
+end
+
+-- -----------------------------
+-- State
+-- -----------------------------
 -- phase: "idle" | "active" | "ended"
 local phase = "idle"
 local encounterID = 0
@@ -81,9 +92,9 @@ local myName = ""
 local myClass = ""
 local myJumps = 0
 
-local totals = {}
-local lastSeen = {}
-local classByName = {}
+local totals = {}      -- name -> jumps
+local lastSeen = {}    -- name -> timestamp
+local classByName = {} -- name -> classFile
 
 local lastBroadcastAt = 0
 local lastHeartbeatAt = 0
@@ -91,6 +102,16 @@ local pendingBroadcast = false
 
 local claimWinner = nil
 local lastJumpAt = 0
+
+-- Throttle for hello/request spam
+local throttle = { hello = 0, req = 0 }
+local function Throttled(key, window)
+  window = window or 1.0
+  local t = Now()
+  if throttle[key] and (t - throttle[key] < window) then return true end
+  throttle[key] = t
+  return false
+end
 
 -- -----------------------------
 -- UI
@@ -221,14 +242,12 @@ local function UpdateUI()
   for i = 1, lines do
     local fs = ui.lines[i]
     local row = arr[i]
-
     if row then
       local alpha = 1
       if row.age > timeout then
         alpha = 1 - ((row.age - timeout) / math.max(0.01, fade))
         alpha = Clamp(alpha, 0, 1)
       end
-
       local r, g, b = NameColor(row.name)
       fs:SetText(string.format("%d. %s %d", i, row.name, row.count))
       fs:SetTextColor(r, g, b, 1)
@@ -241,19 +260,33 @@ local function UpdateUI()
 end
 
 -- -----------------------------
--- Addon comms (SYNC FIX HERE)
+-- Addon comms
 -- -----------------------------
 local function SendComm(msg)
-  -- Send to every plausible group channel to avoid “no sync” edge cases.
-  -- Duplicate messages are harmless (same totals overwrite).
-  if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then
-    C_ChatInfo.SendAddonMessage(PREFIX, msg, "INSTANCE_CHAT")
-  end
-  if IsInRaid() then
-    C_ChatInfo.SendAddonMessage(PREFIX, msg, "RAID")
-  elseif IsInGroup() then
-    C_ChatInfo.SendAddonMessage(PREFIX, msg, "PARTY")
-  end
+  local ch = GetGroupChannel()
+  if not ch then return end
+  C_ChatInfo.SendAddonMessage(PREFIX, msg, ch)
+end
+
+-- HELLO/REQ/STATE
+local function SendHello()
+  if phase == "idle" then return end
+  if Throttled("hello", 2.0) then return end
+  -- HELLO:<enc>:<class>
+  SendComm(string.format("HELLO:%d:%s", encounterID, myClass or ""))
+end
+
+local function SendRequest()
+  if phase == "idle" then return end
+  if Throttled("req", 1.5) then return end
+  -- REQ:<enc>
+  SendComm(string.format("REQ:%d", encounterID))
+end
+
+local function SendState()
+  if phase == "idle" then return end
+  -- S:<enc>:<count>:<class>
+  SendComm(string.format("S:%d:%d:%s", encounterID, myJumps, myClass or ""))
 end
 
 local function BroadcastUpdate(force)
@@ -269,7 +302,7 @@ local function BroadcastUpdate(force)
 
   pendingBroadcast = false
   lastBroadcastAt = t
-  SendComm(string.format("U:%d:%d:%s", encounterID, myJumps, myClass or ""))
+  SendState()
 end
 
 local function Heartbeat()
@@ -277,10 +310,12 @@ local function Heartbeat()
   local t = Now()
   if (t - lastHeartbeatAt) < (db.heartbeatInterval or DEFAULTS.heartbeatInterval) then return end
   lastHeartbeatAt = t
-  SendComm(string.format("H:%d:%d:%s", encounterID, myJumps, myClass or ""))
+  SendHello()
+  SendState()
 end
 
 local function SendClaim()
+  -- C:<enc>:<name>:<count>
   SendComm(string.format("C:%d:%s:%d", encounterID, myName, myJumps))
 end
 
@@ -383,12 +418,8 @@ local function BuildChatLines()
 end
 
 local function PostToChat(lines)
-  local ch = nil
-  if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then ch = "INSTANCE_CHAT"
-  elseif IsInRaid() then ch = "RAID"
-  elseif IsInGroup() then ch = "PARTY" end
+  local ch = GetGroupChannel()
   if not ch then return end
-
   for _, line in ipairs(lines) do
     SendChatMessage(line, ch)
   end
@@ -402,7 +433,7 @@ local function HandleEncounterEndPosting()
     if claimWinner then return end
     if not AmIWinnerByTotals() then return end
 
-    -- IMPORTANT: claim locally first so we don't post before competing claims arrive
+    -- IMPORTANT: claim locally immediately so we don't post before competing claims arrive
     claimWinner = myName
     SendClaim()
 
@@ -422,9 +453,7 @@ local function BeginEncounter(newID, newName)
   encounterName = newName or "Encounter"
 
   myJumps = 0
-  wipe(totals)
-  wipe(lastSeen)
-  wipe(classByName)
+  wipe(totals); wipe(lastSeen); wipe(classByName)
 
   totals[myName] = 0
   lastSeen[myName] = Now()
@@ -435,7 +464,11 @@ local function BeginEncounter(newID, newName)
   pendingBroadcast = false
   claimWinner = nil
 
-  BroadcastUpdate(true)
+  -- Kick off handshake so everyone appears immediately
+  SendHello()
+  SendRequest()
+  SendState()
+
   UpdateUI()
 end
 
@@ -452,7 +485,10 @@ local function FreezeEncounter(encIDFromEvent)
   lastSeen[myName] = Now()
   classByName[myName] = myClass
 
-  SendComm(string.format("U:%d:%d:%s", encounterID, myJumps, myClass or ""))
+  -- Final state push + request others one last time
+  SendState()
+  SendRequest()
+
   UpdateUI()
 end
 
@@ -462,7 +498,7 @@ local function EndEncounterUI()
 end
 
 -- -----------------------------
--- Events / incoming comms
+-- Incoming messages
 -- -----------------------------
 local function NormalizeSender(sender)
   sender = sender or ""
@@ -480,21 +516,42 @@ local function OnAddonMessage(prefix, msg, channel, sender)
   sender = NormalizeSender(sender)
   if sender == "" then return end
 
-  local tag, a, b, c = string.match(msg, "^(%a):([^:]+):([^:]+):?(.*)$")
+  local tag, a, b, c = msg:match("^(%u+):([^:]*):?([^:]*):?(.*)$")
   if not tag then return end
 
-  if tag == "U" or tag == "H" then
+  if tag == "HELLO" then
+    local enc = tonumber(a) or 0
+    local classFile = b or ""
+    if phase == "idle" then return end
+    if enc ~= encounterID then return end
+
+    if classFile ~= "" then classByName[sender] = classFile end
+    -- Respond with our state so they see us immediately
+    SendState()
+    return
+  end
+
+  if tag == "REQ" then
+    local enc = tonumber(a) or 0
+    if phase == "idle" then return end
+    if enc ~= encounterID then return end
+    SendState()
+    return
+  end
+
+  if tag == "S" then
     local enc = tonumber(a)
     local count = tonumber(b)
-    local classFile = c
+    local classFile = c or ""
     if not enc or count == nil then return end
     if phase == "idle" then return end
 
+    -- While encounter UI is active (active OR ended), accept updates (same encounter)
+    if enc ~= encounterID then return end
+
     totals[sender] = count
     lastSeen[sender] = Now()
-    if classFile and classFile ~= "" then
-      classByName[sender] = classFile
-    end
+    if classFile ~= "" then classByName[sender] = classFile end
 
     UpdateUI()
     return
@@ -516,7 +573,7 @@ local function OnAddonMessage(prefix, msg, channel, sender)
 end
 
 -- -----------------------------
--- Slash commands
+-- Slash commands (minimal)
 -- -----------------------------
 local function SlashHelp()
   print("|cffffd100JumpBoss commands:|r")
@@ -525,7 +582,7 @@ local function SlashHelp()
   print("/jb scale <n>")
   print("/jb timeout <s>")
   print("/jb fade <s>")
-  print("/jb top <n>  (chat posts at least top 5)")
+  print("/jb top <n>")
 end
 
 SLASH_JUMPBOSS1 = "/jumpboss"
@@ -534,65 +591,31 @@ SlashCmdList.JUMPBOSS = function(msg)
   msg = (msg or "")
   local lower = msg:lower()
 
-  if lower == "show" then
-    db.show = true
-    ui:Show()
-    UpdateUI()
-    return
-  elseif lower == "hide" then
-    db.show = false
-    ui:Hide()
-    return
-  elseif lower == "lock" then
-    db.locked = true
-    print("JumpBoss: frame locked.")
-    return
-  elseif lower == "unlock" then
-    db.locked = false
-    print("JumpBoss: frame unlocked (drag to move).")
-    return
-  end
+  if lower == "show" then db.show = true; ui:Show(); UpdateUI(); return end
+  if lower == "hide" then db.show = false; ui:Hide(); return end
+  if lower == "lock" then db.locked = true; print("JumpBoss: frame locked."); return end
+  if lower == "unlock" then db.locked = false; print("JumpBoss: frame unlocked (drag to move)."); return end
 
   local cmd, val = lower:match("^(%S+)%s*(.*)$")
   if cmd == "scale" and val ~= "" then
     local n = tonumber(val)
-    if n and n > 0.2 and n < 3.0 then
-      db.scale = n
-      ApplyUISettings()
-      print(("JumpBoss: scale set to %.2f"):format(n))
-      return
-    end
+    if n and n > 0.2 and n < 3.0 then db.scale = n; ApplyUISettings(); return end
   elseif cmd == "timeout" and val ~= "" then
     local n = tonumber(val)
-    if n and n >= 0.5 and n <= 300 then
-      db.staleTimeout = n
-      print(("JumpBoss: stale timeout set to %.1fs"):format(n))
-      return
-    end
+    if n and n >= 0.5 and n <= 300 then db.staleTimeout = n; return end
   elseif cmd == "fade" and val ~= "" then
     local n = tonumber(val)
-    if n and n >= 0.2 and n <= 60 then
-      db.fadeDuration = n
-      print(("JumpBoss: fade duration set to %.1fs"):format(n))
-      return
-    end
+    if n and n >= 0.2 and n <= 60 then db.fadeDuration = n; return end
   elseif cmd == "top" and val ~= "" then
     local n = tonumber(val)
-    if n and n >= 5 and n <= 50 then
-      db.postTopN = math.floor(n)
-      print(("JumpBoss: chat top N set to %d (min 5)"):format(db.postTopN))
-      return
-    else
-      print("JumpBoss: /jb top must be between 5 and 50.")
-      return
-    end
+    if n and n >= 5 and n <= 50 then db.postTopN = math.floor(n); return end
   end
 
   SlashHelp()
 end
 
 -- -----------------------------
--- Frame events
+-- Events
 -- -----------------------------
 f:SetScript("OnEvent", function(self, event, ...)
   if event == "ADDON_LOADED" then
@@ -606,6 +629,7 @@ f:SetScript("OnEvent", function(self, event, ...)
     JumpBossDB = JumpBossDB or {}
     db = JumpBossDB
     CopyDefaults(db, DEFAULTS)
+
     if type(db.postTopN) == "number" and db.postTopN < 5 then db.postTopN = 5 end
 
     C_ChatInfo.RegisterAddonMessagePrefix(PREFIX)
@@ -635,8 +659,12 @@ f:SetScript("OnEvent", function(self, event, ...)
     return
   end
 
-  if event == "PLAYER_ENTERING_WORLD" then
-    UpdateUI()
+  if event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
+    -- If we're in an encounter UI state, re-handshake (covers reloads / late joins)
+    if phase ~= "idle" then
+      SendHello()
+      SendRequest()
+    end
     return
   end
 end)
@@ -645,8 +673,10 @@ f:RegisterEvent("ADDON_LOADED")
 f:RegisterEvent("CHAT_MSG_ADDON")
 f:RegisterEvent("ENCOUNTER_START")
 f:RegisterEvent("ENCOUNTER_END")
+f:RegisterEvent("GROUP_ROSTER_UPDATE")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
 
+-- Tick
 ui:SetScript("OnUpdate", function(self, elapsed)
   if phase == "idle" then return end
 
