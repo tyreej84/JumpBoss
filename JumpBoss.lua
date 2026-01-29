@@ -140,7 +140,7 @@ local function ResizeUI()
   local w = db.width or DEFAULTS.width
 
   -- Compact header area + lines
-  local h = 22 + (lines * lineH) + 6
+  local h = 26 + (lines * lineH) + 6
   ui:SetSize(w, h)
 
   for i = 1, lines do
@@ -149,7 +149,7 @@ local function ResizeUI()
     end
     local fs = ui.lines[i]
     fs:ClearAllPoints()
-    fs:SetPoint("TOPLEFT", 6, -(22 + (i - 1) * lineH))
+    fs:SetPoint("TOPLEFT", 6, -(26 + (i - 1) * lineH))
     fs:SetText("")
     fs:SetAlpha(1)
     fs:Show()
