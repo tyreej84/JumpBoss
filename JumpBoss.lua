@@ -3,14 +3,16 @@
 -- Silent addon comms during encounter, ZERO chat until encounter end.
 -- At end: ONLY the winner posts the leaderboard.
 --
--- v1.0.7 drop-in replacement fixes:
---  - Only ONE person posts at end (robust claim arbitration; prevents multiple winners posting)
---  - Jump counting stops immediately when the boss dies (phase state machine)
---  - Waits ~5 seconds to sync totals before determining winner
---  - Chat always includes at least Top 5 (or fewer if fewer participants)
---  - Leaderboard remains visible ~20 seconds after boss death (display only; no counting)
---  - Accepts updates while encounter UI is active even if encounter IDs mismatch (reload/missed ENCOUNTER_START)
---  - Spacing between "You: X" and rows, class color fallback
+-- Sync Fix:
+--  - Broadcast addon messages to BOTH INSTANCE_CHAT and PARTY/RAID as applicable
+--    (prevents “no syncing” in some group types)
+--
+-- v1.0.7 behavior retained:
+--  - Only ONE winner posts (claim arbitration)
+--  - Jump counting stops immediately at boss death
+--  - Waits ~5 seconds to sync totals, then determines winner
+--  - Posts at least Top 5 (or fewer if fewer participants)
+--  - UI stays visible ~20s after boss death (display only)
 
 local ADDON_NAME = ...
 local PREFIX = "JBT1"
@@ -18,15 +20,12 @@ local PREFIX = "JBT1"
 local f = CreateFrame("Frame")
 local db
 
--- -----------------------------
--- Defaults
--- -----------------------------
 local DEFAULTS = {
   show = true,
   locked = false,
   scale = 1.0,
 
-  maxLines = 5,               -- UI: Top 5
+  maxLines = 5,
   width = 150,
   lineHeight = 13,
 
@@ -36,11 +35,11 @@ local DEFAULTS = {
   staleTimeout = 120.0,
   fadeDuration = 10.0,
 
-  syncWindow = 5.0,           -- seconds after ENCOUNTER_END to sync totals
-  claimPostDelay = 1.00,      -- IMPORTANT: allow time for other claims to arrive before posting
-  postVisibleSeconds = 20.0,  -- keep UI visible after boss death
+  syncWindow = 5.0,
+  claimPostDelay = 1.00,
+  postVisibleSeconds = 20.0,
 
-  postTopN = 5,               -- min top N in chat (or fewer if fewer total)
+  postTopN = 5,
 
   pos = { point = "CENTER", relPoint = "CENTER", x = 0, y = 160 },
 }
@@ -67,23 +66,13 @@ local function PlayerFullName()
   return name
 end
 
-local function InGroupChannel()
-  if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then return "INSTANCE_CHAT" end
-  if IsInRaid() then return "RAID" end
-  if IsInGroup() then return "PARTY" end
-  return nil
-end
-
 local function Clamp(x, a, b)
   if x < a then return a end
   if x > b then return b end
   return x
 end
 
--- -----------------------------
--- State
--- -----------------------------
--- phase: "idle" (no encounter), "active" (counting), "ended" (frozen, syncing + displaying)
+-- phase: "idle" | "active" | "ended"
 local phase = "idle"
 local encounterID = 0
 local encounterName = ""
@@ -92,9 +81,9 @@ local myName = ""
 local myClass = ""
 local myJumps = 0
 
-local totals = {}      -- name -> jumps
-local lastSeen = {}    -- name -> timestamp
-local classByName = {} -- name -> classFile
+local totals = {}
+local lastSeen = {}
+local classByName = {}
 
 local lastBroadcastAt = 0
 local lastHeartbeatAt = 0
@@ -252,12 +241,19 @@ local function UpdateUI()
 end
 
 -- -----------------------------
--- Addon comms
+-- Addon comms (SYNC FIX HERE)
 -- -----------------------------
 local function SendComm(msg)
-  local ch = InGroupChannel()
-  if not ch then return end
-  C_ChatInfo.SendAddonMessage(PREFIX, msg, ch)
+  -- Send to every plausible group channel to avoid “no sync” edge cases.
+  -- Duplicate messages are harmless (same totals overwrite).
+  if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then
+    C_ChatInfo.SendAddonMessage(PREFIX, msg, "INSTANCE_CHAT")
+  end
+  if IsInRaid() then
+    C_ChatInfo.SendAddonMessage(PREFIX, msg, "RAID")
+  elseif IsInGroup() then
+    C_ChatInfo.SendAddonMessage(PREFIX, msg, "PARTY")
+  end
 end
 
 local function BroadcastUpdate(force)
@@ -285,12 +281,11 @@ local function Heartbeat()
 end
 
 local function SendClaim()
-  -- C:<encounterID>:<winnerName>:<count>
   SendComm(string.format("C:%d:%s:%d", encounterID, myName, myJumps))
 end
 
 -- -----------------------------
--- Jump detection (ONLY during "active")
+-- Jump detection (ONLY during active)
 -- -----------------------------
 hooksecurefunc("JumpOrAscendStart", function()
   if phase ~= "active" then return end
@@ -333,7 +328,6 @@ local function AmIWinnerByTotals()
   local maxCount = arr[1].count or 0
   if myJumps ~= maxCount then return false end
 
-  -- tie-break alphabetically among maxCount
   local best = nil
   for _, row in ipairs(arr) do
     if row.count ~= maxCount then break end
@@ -389,8 +383,12 @@ local function BuildChatLines()
 end
 
 local function PostToChat(lines)
-  local ch = InGroupChannel()
+  local ch = nil
+  if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then ch = "INSTANCE_CHAT"
+  elseif IsInRaid() then ch = "RAID"
+  elseif IsInGroup() then ch = "PARTY" end
   if not ch then return end
+
   for _, line in ipairs(lines) do
     SendChatMessage(line, ch)
   end
@@ -404,13 +402,11 @@ local function HandleEncounterEndPosting()
     if claimWinner then return end
     if not AmIWinnerByTotals() then return end
 
-    -- CRITICAL: assume we are the claimant locally immediately,
-    -- so we don't post before we receive competing claims.
+    -- IMPORTANT: claim locally first so we don't post before competing claims arrive
     claimWinner = myName
     SendClaim()
 
     C_Timer.After(postDelay, function()
-      -- If we saw another claim from a "better" winner, do not post.
       if claimWinner ~= myName then return end
       PostToChat(BuildChatLines())
     end)
@@ -444,11 +440,9 @@ local function BeginEncounter(newID, newName)
 end
 
 local function FreezeEncounter(encIDFromEvent)
-  -- Freeze counting immediately; keep UI up
   phase = "ended"
   pendingBroadcast = false
 
-  -- Heal encounterID if missed ENCOUNTER_START (reload mid-fight)
   if encounterID == 0 or encounterID ~= encIDFromEvent then
     encounterID = encIDFromEvent or encounterID
     if encounterName == "" then encounterName = "Encounter" end
@@ -458,9 +452,7 @@ local function FreezeEncounter(encIDFromEvent)
   lastSeen[myName] = Now()
   classByName[myName] = myClass
 
-  -- Final broadcast of our frozen count
   SendComm(string.format("U:%d:%d:%s", encounterID, myJumps, myClass or ""))
-
   UpdateUI()
 end
 
@@ -470,7 +462,7 @@ local function EndEncounterUI()
 end
 
 -- -----------------------------
--- Event handlers
+-- Events / incoming comms
 -- -----------------------------
 local function NormalizeSender(sender)
   sender = sender or ""
@@ -495,10 +487,9 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     local enc = tonumber(a)
     local count = tonumber(b)
     local classFile = c
-    if not enc or not count then return end
+    if not enc or count == nil then return end
     if phase == "idle" then return end
 
-    -- While encounter UI is active (active OR ended), accept updates even if enc differs
     totals[sender] = count
     lastSeen[sender] = Now()
     if classFile and classFile ~= "" then
@@ -516,8 +507,7 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     if not enc or not winnerName or winnerName == "" or not winnerCount then return end
     if enc ~= encounterID then return end
 
-    -- Robust arbitration: keep the alphabetically smallest claimed winner.
-    -- (All claimers should only claim when they believe they are top by totals.)
+    -- Arbitration: keep alphabetically smallest claimed winner
     if not claimWinner or winnerName < claimWinner then
       claimWinner = winnerName
     end
@@ -525,6 +515,9 @@ local function OnAddonMessage(prefix, msg, channel, sender)
   end
 end
 
+-- -----------------------------
+-- Slash commands
+-- -----------------------------
 local function SlashHelp()
   print("|cffffd100JumpBoss commands:|r")
   print("/jb show | hide")
@@ -598,6 +591,9 @@ SlashCmdList.JUMPBOSS = function(msg)
   SlashHelp()
 end
 
+-- -----------------------------
+-- Frame events
+-- -----------------------------
 f:SetScript("OnEvent", function(self, event, ...)
   if event == "ADDON_LOADED" then
     local name = ...
@@ -610,7 +606,6 @@ f:SetScript("OnEvent", function(self, event, ...)
     JumpBossDB = JumpBossDB or {}
     db = JumpBossDB
     CopyDefaults(db, DEFAULTS)
-
     if type(db.postTopN) == "number" and db.postTopN < 5 then db.postTopN = 5 end
 
     C_ChatInfo.RegisterAddonMessagePrefix(PREFIX)
