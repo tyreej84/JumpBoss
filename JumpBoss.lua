@@ -3,13 +3,11 @@
 -- Silent addon comms during encounter, ZERO chat until encounter end.
 -- At end: ONLY the winner posts the leaderboard.
 --
--- v1.0.4 drop-in replacement updates:
---  - Jump counting stops immediately at boss death (ENCOUNTER_END)
---  - Wait ~5 seconds at encounter end to sync everyone’s totals before winner claims/posts
---  - Chat output always includes TOP 5 minimum (or fewer if fewer participants exist)
---  - Leaderboard stays visible ~20s after boss death
---  - Accepts updates during active encounter display even if encounter IDs mismatch (reload/missed ENCOUNTER_START)
---  - Extended stale timeout/fade (2 minutes+) + improved spacing
+-- Fixes:
+--  - Jumps do NOT count after boss death (counting only in phase "active")
+--  - Reliable end-of-fight posting: waits 5s to sync totals, then winner posts
+--  - If someone reloaded mid-fight and missed ENCOUNTER_START, ENCOUNTER_END still works
+--  - Chat output includes top 5 (or fewer if fewer participants)
 
 local ADDON_NAME = ...
 local PREFIX = "JBT1"
@@ -25,7 +23,7 @@ local DEFAULTS = {
   locked = false,
   scale = 1.0,
 
-  maxLines = 5,              -- UI: Top 5
+  maxLines = 5,               -- UI: Top 5
   width = 150,
   lineHeight = 13,
 
@@ -35,12 +33,11 @@ local DEFAULTS = {
   staleTimeout = 120.0,
   fadeDuration = 10.0,
 
-  -- IMPORTANT: end-of-fight sync time
-  claimWindow = 5.00,        -- wait 5s to collect final totals
-  claimPostDelay = 0.50,     -- after claiming, wait a moment then post
+  syncWindow = 5.0,           -- seconds after ENCOUNTER_END to sync totals
+  claimPostDelay = 0.50,      -- delay after claim before posting
+  postVisibleSeconds = 20.0,  -- keep UI visible after boss death
 
-  postTopN = 5,              -- always post at least top 5 (or fewer if fewer total)
-  postVisibleSeconds = 20.0, -- keep UI visible after ENCOUNTER_END
+  postTopN = 5,               -- min top N in chat (or fewer if fewer total)
 
   pos = { point = "CENTER", relPoint = "CENTER", x = 0, y = 160 },
 }
@@ -56,9 +53,7 @@ local function CopyDefaults(dst, src)
   end
 end
 
-local function Now()
-  return GetTime() or 0
-end
+local function Now() return GetTime() or 0 end
 
 local function PlayerFullName()
   local name, realm = UnitName("player")
@@ -85,13 +80,11 @@ end
 -- -----------------------------
 -- State
 -- -----------------------------
--- encounterActive = we are actively counting + broadcasting (stops immediately on ENCOUNTER_END)
--- uiActive        = we keep the UI visible (stays on for postVisibleSeconds after ENCOUNTER_END)
-local encounterActive = false
-local uiActive = false
-
+-- phase: "idle" (no encounter), "active" (counting), "ended" (frozen, syncing + displaying)
+local phase = "idle"
 local encounterID = 0
 local encounterName = ""
+
 local myName = ""
 local myClass = ""
 local myJumps = 0
@@ -147,7 +140,7 @@ local function ResizeUI()
   local lineH = db.lineHeight or DEFAULTS.lineHeight
   local w = db.width or DEFAULTS.width
 
-  local headerH = 26 -- spacing so "You:" isn't smashed into row 1
+  local headerH = 26
   local h = headerH + (lines * lineH) + 6
   ui:SetSize(w, h)
 
@@ -215,7 +208,7 @@ end
 local function UpdateUI()
   if not db.show then return end
 
-  if not uiActive then
+  if phase == "idle" then
     ui.sub:SetText("Not in encounter")
     for i = 1, (db.maxLines or DEFAULTS.maxLines) do
       if ui.lines[i] then
@@ -226,8 +219,6 @@ local function UpdateUI()
     return
   end
 
-  -- When the boss is dead, encounterActive is false but uiActive stays true.
-  -- We still show your final jump count and the frozen leaderboard.
   ui.sub:SetText(string.format("You: %d", myJumps))
 
   local arr = BuildSortedVisibleTotals()
@@ -258,7 +249,7 @@ local function UpdateUI()
 end
 
 -- -----------------------------
--- Addon comms (silent)
+-- Addon comms
 -- -----------------------------
 local function SendComm(msg)
   local ch = InGroupChannel()
@@ -267,7 +258,7 @@ local function SendComm(msg)
 end
 
 local function BroadcastUpdate(force)
-  if not encounterActive then return end
+  if phase ~= "active" then return end
   local t = Now()
 
   if not force then
@@ -283,7 +274,7 @@ local function BroadcastUpdate(force)
 end
 
 local function Heartbeat()
-  if not encounterActive then return end
+  if phase ~= "active" then return end
   local t = Now()
   if (t - lastHeartbeatAt) < (db.heartbeatInterval or DEFAULTS.heartbeatInterval) then return end
   lastHeartbeatAt = t
@@ -295,10 +286,10 @@ local function SendClaim()
 end
 
 -- -----------------------------
--- Jump detection (STOP after boss dies)
+-- Jump detection (ONLY during phase "active")
 -- -----------------------------
 hooksecurefunc("JumpOrAscendStart", function()
-  if not encounterActive then return end
+  if phase ~= "active" then return end
   if UnitInVehicle("player") or UnitOnTaxi("player") then return end
 
   local t = Now()
@@ -335,11 +326,9 @@ local function AmIWinner()
   local arr = BuildSortedTotalsAll()
   if #arr == 0 then return false end
 
-  local top = arr[1]
-  local maxCount = top and top.count or 0
+  local maxCount = arr[1].count or 0
   if myJumps ~= maxCount then return false end
 
-  -- tie-break: alphabetically smallest among tied max
   local best = nil
   for _, row in ipairs(arr) do
     if row.count ~= maxCount then break end
@@ -353,13 +342,17 @@ local function BuildChatLines()
   local boss = encounterName ~= "" and encounterName or "Boss"
   local total = #arr
 
-  local minTop = 5
-  local configured = tonumber(db.postTopN or DEFAULTS.postTopN or 5) or 5
-  if configured < minTop then configured = minTop end
-  local topN = math.min(math.max(minTop, configured), total)
-
   local lines = {}
   table.insert(lines, string.format("Jump Leaderboard - %s", boss))
+
+  if total == 0 then
+    table.insert(lines, "No JumpBoss participants recorded.")
+    return lines
+  end
+
+  local configured = tonumber(db.postTopN or DEFAULTS.postTopN or 5) or 5
+  if configured < 5 then configured = 5 end
+  local topN = math.min(configured, total) -- top 5 minimum, but cannot exceed total
 
   local current = ""
   local function flush()
@@ -398,16 +391,14 @@ local function PostToChat(lines)
   end
 end
 
-local function HandleEncounterEnd()
-  local window = db.claimWindow or DEFAULTS.claimWindow
+local function HandleEncounterEndPosting()
+  local window = db.syncWindow or DEFAULTS.syncWindow
   local postDelay = db.claimPostDelay or DEFAULTS.claimPostDelay
 
-  -- Wait ~5 seconds so everyone’s final U/H messages arrive
   C_Timer.After(window, function()
     if claimWinner then return end
     if not AmIWinner() then return end
 
-    -- Winner claims silently, then posts
     SendClaim()
     C_Timer.After(postDelay, function()
       if claimWinner and claimWinner ~= myName then return end
@@ -417,16 +408,14 @@ local function HandleEncounterEnd()
 end
 
 -- -----------------------------
--- Encounter lifecycle
+-- Lifecycle
 -- -----------------------------
-local function ResetEncounterState(newID, newName)
-  encounterActive = true
-  uiActive = true
-
+local function BeginEncounter(newID, newName)
+  phase = "active"
   encounterID = newID or 0
   encounterName = newName or "Encounter"
-  myJumps = 0
 
+  myJumps = 0
   wipe(totals)
   wipe(lastSeen)
   wipe(classByName)
@@ -438,15 +427,36 @@ local function ResetEncounterState(newID, newName)
   lastBroadcastAt = 0
   lastHeartbeatAt = 0
   pendingBroadcast = false
-
   claimWinner = nil
 
   BroadcastUpdate(true)
   UpdateUI()
 end
 
+local function EndEncounterFreeze(encIDFromEvent)
+  -- Freeze counting immediately but keep UI visible (phase "ended")
+  phase = "ended"
+  pendingBroadcast = false
+
+  -- Heal encounterID if we missed ENCOUNTER_START (reload mid-fight)
+  if encounterID == 0 or encounterID ~= encIDFromEvent then
+    encounterID = encIDFromEvent or encounterID
+    if encounterName == "" then encounterName = "Encounter" end
+  end
+
+  -- Ensure self is present in totals
+  totals[myName] = myJumps
+  lastSeen[myName] = Now()
+  classByName[myName] = myClass
+
+  -- One final broadcast of our frozen number
+  SendComm(string.format("U:%d:%d:%s", encounterID, myJumps, myClass or ""))
+
+  UpdateUI()
+end
+
 local function EndEncounterUI()
-  uiActive = false
+  phase = "idle"
   UpdateUI()
 end
 
@@ -478,9 +488,9 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     local classFile = c
 
     if not enc or not count then return end
-    if not uiActive then return end
+    if phase == "idle" then return end
 
-    -- Accept updates while our encounter UI is active even if encounter IDs mismatch
+    -- While we're showing the encounter UI (active OR ended), accept updates even if enc differs
     totals[sender] = count
     lastSeen[sender] = Now()
     if classFile and classFile ~= "" then
@@ -608,32 +618,21 @@ f:SetScript("OnEvent", function(self, event, ...)
 
   if event == "ENCOUNTER_START" then
     local encID, encName = ...
-    ResetEncounterState(encID, encName)
+    BeginEncounter(encID, encName)
     return
   end
 
   if event == "ENCOUNTER_END" then
-    local encID = ...
-    if uiActive and encID == encounterID then
-      -- STOP counting immediately
-      encounterActive = false
-      pendingBroadcast = false
-
-      -- Send one final update immediately (so our last number is broadcast)
-      SendComm(string.format("U:%d:%d:%s", encounterID, myJumps, myClass or ""))
-
-      -- Begin the 5s tally window; winner claims/posts after that
-      HandleEncounterEnd()
+    local encID, _, _, _, success = ...
+    -- Freeze counting immediately and start the sync+post flow
+    if phase ~= "idle" then
+      EndEncounterFreeze(encID)
+      HandleEncounterEndPosting()
+      C_Timer.After(db.postVisibleSeconds or DEFAULTS.postVisibleSeconds, EndEncounterUI)
     else
-      -- If we somehow got ENCOUNTER_END without our state, still stop counting
-      encounterActive = false
+      -- If we somehow never entered encounter state, still prevent any counting (already idle)
+      -- and do nothing.
     end
-
-    -- Keep UI visible after boss death
-    local keep = db.postVisibleSeconds or DEFAULTS.postVisibleSeconds or 20.0
-    C_Timer.After(keep, function()
-      EndEncounterUI()
-    end)
     return
   end
 
@@ -649,13 +648,10 @@ f:RegisterEvent("ENCOUNTER_START")
 f:RegisterEvent("ENCOUNTER_END")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
 
--- OnUpdate:
---  - During active encounter: heartbeat + broadcasts + UI refresh
---  - After encounter end (UI still visible): UI refresh only (no more counting or sending)
 ui:SetScript("OnUpdate", function(self, elapsed)
-  if not uiActive then return end
+  if phase == "idle" then return end
 
-  if encounterActive then
+  if phase == "active" then
     if pendingBroadcast then
       BroadcastUpdate(false)
     end
