@@ -22,24 +22,44 @@ jobs:
           rm -rf dist
           mkdir -p dist/JumpBoss
 
-          # Copy addon files into the folder that will be zipped
           cp -f JumpBoss.toc dist/JumpBoss/JumpBoss.toc
           cp -f JumpBoss.lua dist/JumpBoss/JumpBoss.lua
 
-          # Include docs at root of zip (optional but nice)
           if [ -f README.md ]; then cp -f README.md dist/README.md; fi
           if [ -f CHANGELOG.md ]; then cp -f CHANGELOG.md dist/CHANGELOG.md; fi
           if [ -f LICENSE.md ]; then cp -f LICENSE.md dist/LICENSE.md; fi
 
-      - name: Replace @project-version@ in .toc
+      - name: Replace @project-version@ in .toc (from tag) + verify
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"         # e.g. v1.0.9
-          VER="${TAG#v}"                   # e.g. 1.0.9
 
+          TAG="${GITHUB_REF_NAME}"   # e.g. v1.2.0
+          VER="${TAG#v}"             # e.g. 1.2.0
           TOC="dist/JumpBoss/JumpBoss.toc"
-          if [ -f "$TOC" ]; then
-            sed -i "s/@project-version@/${VER}/g" "$TOC"
+
+          echo "Tag: $TAG"
+          echo "Version: $VER"
+          echo "TOC path: $TOC"
+
+          test -f "$TOC"
+
+          echo "Before:"
+          grep -n "## Version:" "$TOC" || true
+          grep -n "@project-version@" "$TOC" || true
+
+          # Normalize line endings just in case (handles CRLF)
+          sed -i 's/\r$//' "$TOC"
+
+          # Replace ONLY the Version token (safer than global replace)
+          sed -i -E "s/^(## Version: )@project-version@/\1${VER}/" "$TOC"
+
+          echo "After:"
+          grep -n "## Version:" "$TOC" || true
+
+          # Fail if token still exists
+          if grep -q "@project-version@" "$TOC"; then
+            echo "ERROR: @project-version@ was not replaced in $TOC"
+            exit 1
           fi
 
       - name: Create zip
@@ -49,7 +69,7 @@ jobs:
           ZIP="JumpBoss-${TAG}.zip"
           (cd dist && zip -r "../${ZIP}" .)
 
-      - name: Create GitHub Release (if missing) and upload asset
+      - name: Create GitHub Release and upload asset
         uses: softprops/action-gh-release@v2
         with:
           files: JumpBoss-${{ github.ref_name }}.zip
