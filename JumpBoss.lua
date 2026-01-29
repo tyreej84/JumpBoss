@@ -3,12 +3,13 @@
 -- Silent addon comms during encounter, ZERO chat until encounter end.
 -- At end: ONLY the winner posts the leaderboard.
 --
--- Small UI defaults (top 5) + timeout fade + class colors (fallback white)
--- Drop-in replacement (v1.0.2 behavior set):
---  - Leaderboard stays visible ~20s after boss dies (so people can see/paste)
---  - Keeps spacing between "You: X" and rows
+-- v1.0.3 drop-in replacement updates:
+--  - Waits longer at ENCOUNTER_END before winner claims/posts (better tally accuracy)
+--  - Chat output always posts TOP 5 minimum (or fewer if fewer participants exist)
+--  - Keeps leaderboard visible ~20s after boss death
 --  - Accepts updates during active encounter even if encounter IDs mismatch (reload/missed ENCOUNTER_START)
 --  - Extended stale timeout/fade (2 minutes+) as requested
+--  - Spacing between "You: X" and rows
 
 local ADDON_NAME = ...
 local PREFIX = "JBT1"
@@ -24,7 +25,7 @@ local DEFAULTS = {
   locked = false,
   scale = 1.0,
 
-  maxLines = 5,              -- TOP 5 only
+  maxLines = 5,              -- TOP 5 only (UI)
   width = 150,               -- small width
   lineHeight = 13,           -- compact text
 
@@ -34,9 +35,11 @@ local DEFAULTS = {
   staleTimeout = 120.0,      -- seconds since last update before fading starts
   fadeDuration = 10.0,       -- seconds to fade out before disappearing
 
-  claimWindow = 0.60,        -- seconds to wait at encounter end for last updates
-  postTopN = 10,             -- top N to include in the final chat post
+  -- IMPORTANT: wait longer so everyone can send final totals and we can determine the real winner
+  claimWindow = 1.00,        -- seconds to wait at encounter end for last updates (was 0.60)
+  claimPostDelay = 0.25,     -- small delay after claim before posting
 
+  postTopN = 5,              -- always post at least top 5 (or fewer if fewer jumpers)
   postVisibleSeconds = 20.0, -- keep the UI visible after ENCOUNTER_END
 
   pos = { point = "CENTER", relPoint = "CENTER", x = 0, y = 160 },
@@ -383,7 +386,13 @@ end
 local function BuildChatLines()
   local arr = BuildSortedTotalsAll()
   local boss = encounterName ~= "" and encounterName or "Boss"
-  local topN = math.max(1, math.min(db.postTopN or DEFAULTS.postTopN, #arr))
+  local total = #arr
+
+  -- Always post at least TOP 5, or all participants if fewer than 5
+  local minTop = 5
+  local configured = tonumber(db.postTopN or DEFAULTS.postTopN or 5) or 5
+  if configured < minTop then configured = minTop end
+  local topN = math.min(math.max(minTop, configured), total)
 
   local lines = {}
   table.insert(lines, string.format("Jump Leaderboard - %s", boss))
@@ -427,13 +436,16 @@ end
 
 local function HandleEncounterEnd()
   local window = db.claimWindow or DEFAULTS.claimWindow
+  local postDelay = db.claimPostDelay or DEFAULTS.claimPostDelay
 
+  -- Wait so everyone can send their final updates first
   C_Timer.After(window, function()
     if claimWinner then return end
     if not AmIWinner() then return end
 
+    -- Winner claims silently, then posts after a short delay
     SendClaim()
-    C_Timer.After(0.20, function()
+    C_Timer.After(postDelay, function()
       if claimWinner and claimWinner ~= myName then return end
       PostToChat(BuildChatLines())
     end)
@@ -504,6 +516,7 @@ local function SlashHelp()
   print("/jb scale <n>")
   print("/jb timeout <s>   (stale seconds)")
   print("/jb fade <s>      (fade seconds)")
+  print("/jb top <n>       (chat posts at least top 5)")
 end
 
 SLASH_JUMPBOSS1 = "/jumpboss"
@@ -554,6 +567,16 @@ SlashCmdList.JUMPBOSS = function(msg)
       print(("JumpBoss: fade duration set to %.1fs"):format(n))
       return
     end
+  elseif cmd == "top" and val ~= "" then
+    local n = tonumber(val)
+    if n and n >= 5 and n <= 50 then
+      db.postTopN = math.floor(n)
+      print(("JumpBoss: chat top N set to %d (min 5)"):format(db.postTopN))
+      return
+    else
+      print("JumpBoss: /jb top must be between 5 and 50.")
+      return
+    end
   end
 
   SlashHelp()
@@ -571,6 +594,9 @@ f:SetScript("OnEvent", function(self, event, ...)
     JumpBossDB = JumpBossDB or {}
     db = JumpBossDB
     CopyDefaults(db, DEFAULTS)
+
+    -- Enforce rule: chat posts at least top 5
+    if type(db.postTopN) == "number" and db.postTopN < 5 then db.postTopN = 5 end
 
     C_ChatInfo.RegisterAddonMessagePrefix(PREFIX)
     ApplyUISettings()
@@ -592,6 +618,7 @@ f:SetScript("OnEvent", function(self, event, ...)
   if event == "ENCOUNTER_END" then
     local encID = ...
     if inEncounter and encID == encounterID then
+      -- Send a final update immediately so totals are fresh
       BroadcastUpdate(true)
       Heartbeat()
       HandleEncounterEnd()
