@@ -1,18 +1,17 @@
 -- JumpBoss.lua
+-- v1.2.0
+--
 -- Real-time jump leaderboard during boss encounters (addon users only).
 -- Silent addon comms during encounter, ZERO chat until encounter end.
 -- At end: ONLY the winner posts the leaderboard.
 --
--- Live Sync Upgrade:
---  - Uses BreakTimerLite-style channel selection (INSTANCE -> RAID -> PARTY)
---  - HELLO / REQ / STATE handshake (supports reloads + late joins)
---  - Requests state at encounter start and on roster/world changes while active
---  - Interactive updates throughout the encounter
---
--- Winner Posting:
---  - Waits syncWindow seconds after ENCOUNTER_END to collect final totals
---  - Only one winner posts (claim arbitration + delay)
---  - Posts at least Top 5 (or fewer if fewer participants)
+-- Key behaviors:
+--  - Interactive real-time updates during encounters via HELLO/REQ/STATE handshake
+--  - NON-JUMPERS ARE NOT RECORDED (never shown, never posted)
+--  - Jump counting stops immediately on ENCOUNTER_END
+--  - Waits syncWindow seconds before winner selection + claim arbitration
+--  - Winner-only posts top N (default 5) or fewer if fewer jumpers
+--  - UI remains visible post-kill for postVisibleSeconds (default 20s)
 
 local ADDON_NAME = ...
 local PREFIX = "JBT1"
@@ -20,6 +19,9 @@ local PREFIX = "JBT1"
 local f = CreateFrame("Frame")
 local db
 
+-- -----------------------------
+-- Defaults
+-- -----------------------------
 local DEFAULTS = {
   show = true,
   locked = false,
@@ -29,17 +31,17 @@ local DEFAULTS = {
   width = 160,
   lineHeight = 13,
 
-  broadcastInterval = 0.10,
-  heartbeatInterval = 1.25,
+  broadcastInterval = 0.10,   -- throttle for sending state updates on jump spam
+  heartbeatInterval = 1.25,   -- periodic presence + state resend
 
-  staleTimeout = 120.0,
+  staleTimeout = 120.0,       -- purely visual fade for jumpers who stop sending
   fadeDuration = 10.0,
 
-  syncWindow = 5.0,
-  claimPostDelay = 1.00,
-  postVisibleSeconds = 20.0,
+  syncWindow = 5.0,           -- seconds after encounter end to gather final totals
+  claimPostDelay = 1.00,      -- extra time to let claim messages arrive
+  postVisibleSeconds = 20.0,  -- keep UI up after encounter end
 
-  postTopN = 5,
+  postTopN = 5,               -- final chat top N (min 5 enforced)
 
   pos = { point = "CENTER", relPoint = "CENTER", x = 0, y = 160 },
 }
@@ -92,9 +94,10 @@ local myName = ""
 local myClass = ""
 local myJumps = 0
 
-local totals = {}      -- name -> jumps
+local totals = {}      -- name -> jumps (ONLY jumpers)
 local lastSeen = {}    -- name -> timestamp
-local classByName = {} -- name -> classFile
+local classByName = {} -- name -> classFile (for coloring)
+local jumped = {}      -- name -> true once they've jumped at least once
 
 local lastBroadcastAt = 0
 local lastHeartbeatAt = 0
@@ -199,7 +202,7 @@ local function BuildSortedVisibleTotals()
 
   local arr = {}
   for name, count in pairs(totals) do
-    if type(count) == "number" then
+    if type(count) == "number" and count > 0 then
       local seen = lastSeen[name]
       if seen then
         local age = t - seen
@@ -285,14 +288,19 @@ end
 
 local function SendState()
   if phase == "idle" then return end
+
+  -- IMPORTANT: Non-jumpers are not recorded, so we do not broadcast 0.
+  if myJumps <= 0 then return end
+
   -- S:<enc>:<count>:<class>
   SendComm(string.format("S:%d:%d:%s", encounterID, myJumps, myClass or ""))
 end
 
 local function BroadcastUpdate(force)
   if phase ~= "active" then return end
-  local t = Now()
+  if myJumps <= 0 then return end -- never broadcast until first jump
 
+  local t = Now()
   if not force then
     if (t - lastBroadcastAt) < (db.broadcastInterval or DEFAULTS.broadcastInterval) then
       pendingBroadcast = true
@@ -310,6 +318,8 @@ local function Heartbeat()
   local t = Now()
   if (t - lastHeartbeatAt) < (db.heartbeatInterval or DEFAULTS.heartbeatInterval) then return end
   lastHeartbeatAt = t
+
+  -- Presence handshake; state only if you're a jumper.
   SendHello()
   SendState()
 end
@@ -331,6 +341,10 @@ hooksecurefunc("JumpOrAscendStart", function()
   lastJumpAt = t
 
   myJumps = myJumps + 1
+  if myJumps == 1 then
+    jumped[myName] = true
+  end
+
   totals[myName] = myJumps
   lastSeen[myName] = t
   classByName[myName] = myClass
@@ -345,7 +359,7 @@ end)
 local function BuildSortedTotalsAll()
   local arr = {}
   for name, count in pairs(totals) do
-    if type(count) == "number" then
+    if type(count) == "number" and count > 0 then
       table.insert(arr, { name = name, count = count })
     end
   end
@@ -373,16 +387,14 @@ end
 
 local function BuildChatLines()
   local arr = BuildSortedTotalsAll()
-  local boss = encounterName ~= "" and encounterName or "Boss"
+  local boss = (encounterName ~= "" and encounterName) or "Boss"
   local total = #arr
+
+  -- If nobody jumped, nobody posts anything.
+  if total == 0 then return nil end
 
   local lines = {}
   table.insert(lines, string.format("Jump Leaderboard - %s", boss))
-
-  if total == 0 then
-    table.insert(lines, "No JumpBoss participants recorded.")
-    return lines
-  end
 
   local configured = tonumber(db.postTopN or DEFAULTS.postTopN or 5) or 5
   if configured < 5 then configured = 5 end
@@ -413,11 +425,12 @@ local function BuildChatLines()
   end
   flush()
 
-  table.insert(lines, "(Counts only players with JumpBoss.)")
+  table.insert(lines, "(Counts only players with JumpBoss who jumped at least once.)")
   return lines
 end
 
 local function PostToChat(lines)
+  if not lines then return end
   local ch = GetGroupChannel()
   if not ch then return end
   for _, line in ipairs(lines) do
@@ -433,7 +446,7 @@ local function HandleEncounterEndPosting()
     if claimWinner then return end
     if not AmIWinnerByTotals() then return end
 
-    -- IMPORTANT: claim locally immediately so we don't post before competing claims arrive
+    -- Claim locally immediately so we don't post before competing claims arrive
     claimWinner = myName
     SendClaim()
 
@@ -453,21 +466,21 @@ local function BeginEncounter(newID, newName)
   encounterName = newName or "Encounter"
 
   myJumps = 0
-  wipe(totals); wipe(lastSeen); wipe(classByName)
 
-  totals[myName] = 0
-  lastSeen[myName] = Now()
-  classByName[myName] = myClass
+  wipe(totals)
+  wipe(lastSeen)
+  wipe(classByName)
+  wipe(jumped)
 
   lastBroadcastAt = 0
   lastHeartbeatAt = 0
   pendingBroadcast = false
   claimWinner = nil
 
-  -- Kick off handshake so everyone appears immediately
+  -- Handshake so everyone can exchange state quickly during the fight.
   SendHello()
   SendRequest()
-  SendState()
+  -- Do NOT SendState() here (we don't broadcast 0 jumps)
 
   UpdateUI()
 end
@@ -481,11 +494,7 @@ local function FreezeEncounter(encIDFromEvent)
     if encounterName == "" then encounterName = "Encounter" end
   end
 
-  totals[myName] = myJumps
-  lastSeen[myName] = Now()
-  classByName[myName] = myClass
-
-  -- Final state push + request others one last time
+  -- Final push if we are a jumper, plus request others one last time.
   SendState()
   SendRequest()
 
@@ -526,7 +535,7 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     if enc ~= encounterID then return end
 
     if classFile ~= "" then classByName[sender] = classFile end
-    -- Respond with our state so they see us immediately
+    -- Reply with our state only if we're a jumper
     SendState()
     return
   end
@@ -535,6 +544,7 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     local enc = tonumber(a) or 0
     if phase == "idle" then return end
     if enc ~= encounterID then return end
+    -- Reply with our state only if we're a jumper
     SendState()
     return
   end
@@ -545,15 +555,23 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     local classFile = c or ""
     if not enc or count == nil then return end
     if phase == "idle" then return end
-
-    -- While encounter UI is active (active OR ended), accept updates (same encounter)
     if enc ~= encounterID then return end
 
-    totals[sender] = count
-    lastSeen[sender] = Now()
-    if classFile ~= "" then classByName[sender] = classFile end
+    -- Non-jumpers are not recorded:
+    -- Only accept them once they have at least 1 jump.
+    if count <= 0 and not jumped[sender] then
+      -- optionally keep class for coloring if they later jump
+      if classFile ~= "" then classByName[sender] = classFile end
+      return
+    end
 
-    UpdateUI()
+    if count > 0 then
+      jumped[sender] = true
+      totals[sender] = count
+      lastSeen[sender] = Now()
+      if classFile ~= "" then classByName[sender] = classFile end
+      UpdateUI()
+    end
     return
   end
 
@@ -573,7 +591,7 @@ local function OnAddonMessage(prefix, msg, channel, sender)
 end
 
 -- -----------------------------
--- Slash commands (minimal)
+-- Slash commands
 -- -----------------------------
 local function SlashHelp()
   print("|cffffd100JumpBoss commands:|r")
@@ -582,7 +600,7 @@ local function SlashHelp()
   print("/jb scale <n>")
   print("/jb timeout <s>")
   print("/jb fade <s>")
-  print("/jb top <n>")
+  print("/jb top <n>  (min 5)")
 end
 
 SLASH_JUMPBOSS1 = "/jumpboss"
@@ -630,7 +648,9 @@ f:SetScript("OnEvent", function(self, event, ...)
     db = JumpBossDB
     CopyDefaults(db, DEFAULTS)
 
-    if type(db.postTopN) == "number" and db.postTopN < 5 then db.postTopN = 5 end
+    if type(db.postTopN) == "number" and db.postTopN < 5 then
+      db.postTopN = 5
+    end
 
     C_ChatInfo.RegisterAddonMessagePrefix(PREFIX)
     ApplyUISettings()
