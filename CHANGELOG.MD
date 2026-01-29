@@ -1,26 +1,41 @@
 # Changelog
 
-## 1.0.6
+## 1.0.7
 ### Fixed
-- Jump counting now **completely stops immediately when the boss dies**, even while the leaderboard remains visible.
-- Resolved an issue where end-of-encounter chat output could post only the leaderboard header without player results.
-- Fixed unreliable winner selection caused by late or missed final jump updates.
+- Fixed an issue where **multiple players could post the end-of-encounter leaderboard** at the same time.
+- Added robust winner arbitration so **only one winner can ever post**, even in ties or near-simultaneous claims.
+- Prevented race conditions during end-of-encounter claim handling that caused duplicate chat messages.
 
 ### Changed
-- End-of-encounter result posting now waits **~5 seconds** to allow all addon users to synchronize final jump totals before determining the winner.
-- Leaderboard display remains visible for **~20 seconds after boss death**, without affecting jump counts.
-- Final chat output always includes **at least the Top 5 jumpers**, or fewer if fewer participants are present.
+- End-of-encounter winner claiming now:
+  - Assumes local claim immediately
+  - Waits for competing claims
+  - Deterministically resolves to a single winner (alphabetical tie-break)
+- End-of-encounter posting flow is now fully synchronized and resilient to latency.
+- No changes to chat verbosity: output remains **winner-only**.
 
 ### Notes
-- Chat output remains **winner-only**, posted only once per encounter.
+- Jump counting still stops immediately on boss death.
+- Leaderboard display remains visible for ~20 seconds after boss death without affecting results.
 - All addon communication continues to use silent addon messages only.
+
+---
+
+## 1.0.6
+### Fixed
+- Jump counting fully stops immediately when the boss dies, even while the leaderboard remains visible.
+- Fixed end-of-encounter chat output missing participant lines.
+
+### Changed
+- Added a ~5 second sync window after encounter end to allow final jump totals to propagate.
+- Final chat output always includes at least the Top 5 jumpers (or fewer if fewer participants are present).
 
 ---
 
 ## 1.0.5
 ### Fixed
-- Prevented post-kill jumps from affecting final jump totals.
-- Improved reliability of end-of-encounter result posting.
+- Prevented post-kill jumps from affecting final totals.
+- Improved reliability of end-of-encounter posting.
 
 ---
 
@@ -36,7 +51,7 @@
 ### Changed
 - Extended default stale timeout to 120 seconds before fading begins.
 - Extended fade duration to 10 seconds to prevent premature removal of players.
-- Improved vertical spacing between the `You: X` counter and the leaderboard rows.
+- Improved vertical spacing between the `You: X` counter and leaderboard rows.
 
 ---
 

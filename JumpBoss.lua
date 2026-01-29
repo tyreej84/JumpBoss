@@ -3,11 +3,14 @@
 -- Silent addon comms during encounter, ZERO chat until encounter end.
 -- At end: ONLY the winner posts the leaderboard.
 --
--- Fixes:
---  - Jumps do NOT count after boss death (counting only in phase "active")
---  - Reliable end-of-fight posting: waits 5s to sync totals, then winner posts
---  - If someone reloaded mid-fight and missed ENCOUNTER_START, ENCOUNTER_END still works
---  - Chat output includes top 5 (or fewer if fewer participants)
+-- v1.0.7 drop-in replacement fixes:
+--  - Only ONE person posts at end (robust claim arbitration; prevents multiple winners posting)
+--  - Jump counting stops immediately when the boss dies (phase state machine)
+--  - Waits ~5 seconds to sync totals before determining winner
+--  - Chat always includes at least Top 5 (or fewer if fewer participants)
+--  - Leaderboard remains visible ~20 seconds after boss death (display only; no counting)
+--  - Accepts updates while encounter UI is active even if encounter IDs mismatch (reload/missed ENCOUNTER_START)
+--  - Spacing between "You: X" and rows, class color fallback
 
 local ADDON_NAME = ...
 local PREFIX = "JBT1"
@@ -34,7 +37,7 @@ local DEFAULTS = {
   fadeDuration = 10.0,
 
   syncWindow = 5.0,           -- seconds after ENCOUNTER_END to sync totals
-  claimPostDelay = 0.50,      -- delay after claim before posting
+  claimPostDelay = 1.00,      -- IMPORTANT: allow time for other claims to arrive before posting
   postVisibleSeconds = 20.0,  -- keep UI visible after boss death
 
   postTopN = 5,               -- min top N in chat (or fewer if fewer total)
@@ -282,11 +285,12 @@ local function Heartbeat()
 end
 
 local function SendClaim()
+  -- C:<encounterID>:<winnerName>:<count>
   SendComm(string.format("C:%d:%s:%d", encounterID, myName, myJumps))
 end
 
 -- -----------------------------
--- Jump detection (ONLY during phase "active")
+-- Jump detection (ONLY during "active")
 -- -----------------------------
 hooksecurefunc("JumpOrAscendStart", function()
   if phase ~= "active" then return end
@@ -322,13 +326,14 @@ local function BuildSortedTotalsAll()
   return arr
 end
 
-local function AmIWinner()
+local function AmIWinnerByTotals()
   local arr = BuildSortedTotalsAll()
   if #arr == 0 then return false end
 
   local maxCount = arr[1].count or 0
   if myJumps ~= maxCount then return false end
 
+  -- tie-break alphabetically among maxCount
   local best = nil
   for _, row in ipairs(arr) do
     if row.count ~= maxCount then break end
@@ -352,7 +357,7 @@ local function BuildChatLines()
 
   local configured = tonumber(db.postTopN or DEFAULTS.postTopN or 5) or 5
   if configured < 5 then configured = 5 end
-  local topN = math.min(configured, total) -- top 5 minimum, but cannot exceed total
+  local topN = math.min(configured, total)
 
   local current = ""
   local function flush()
@@ -397,11 +402,16 @@ local function HandleEncounterEndPosting()
 
   C_Timer.After(window, function()
     if claimWinner then return end
-    if not AmIWinner() then return end
+    if not AmIWinnerByTotals() then return end
 
+    -- CRITICAL: assume we are the claimant locally immediately,
+    -- so we don't post before we receive competing claims.
+    claimWinner = myName
     SendClaim()
+
     C_Timer.After(postDelay, function()
-      if claimWinner and claimWinner ~= myName then return end
+      -- If we saw another claim from a "better" winner, do not post.
+      if claimWinner ~= myName then return end
       PostToChat(BuildChatLines())
     end)
   end)
@@ -433,23 +443,22 @@ local function BeginEncounter(newID, newName)
   UpdateUI()
 end
 
-local function EndEncounterFreeze(encIDFromEvent)
-  -- Freeze counting immediately but keep UI visible (phase "ended")
+local function FreezeEncounter(encIDFromEvent)
+  -- Freeze counting immediately; keep UI up
   phase = "ended"
   pendingBroadcast = false
 
-  -- Heal encounterID if we missed ENCOUNTER_START (reload mid-fight)
+  -- Heal encounterID if missed ENCOUNTER_START (reload mid-fight)
   if encounterID == 0 or encounterID ~= encIDFromEvent then
     encounterID = encIDFromEvent or encounterID
     if encounterName == "" then encounterName = "Encounter" end
   end
 
-  -- Ensure self is present in totals
   totals[myName] = myJumps
   lastSeen[myName] = Now()
   classByName[myName] = myClass
 
-  -- One final broadcast of our frozen number
+  -- Final broadcast of our frozen count
   SendComm(string.format("U:%d:%d:%s", encounterID, myJumps, myClass or ""))
 
   UpdateUI()
@@ -486,11 +495,10 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     local enc = tonumber(a)
     local count = tonumber(b)
     local classFile = c
-
     if not enc or not count then return end
     if phase == "idle" then return end
 
-    -- While we're showing the encounter UI (active OR ended), accept updates even if enc differs
+    -- While encounter UI is active (active OR ended), accept updates even if enc differs
     totals[sender] = count
     lastSeen[sender] = Now()
     if classFile and classFile ~= "" then
@@ -508,10 +516,10 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     if not enc or not winnerName or winnerName == "" or not winnerCount then return end
     if enc ~= encounterID then return end
 
-    if not claimWinner then
+    -- Robust arbitration: keep the alphabetically smallest claimed winner.
+    -- (All claimers should only claim when they believe they are top by totals.)
+    if not claimWinner or winnerName < claimWinner then
       claimWinner = winnerName
-    else
-      if winnerName < claimWinner then claimWinner = winnerName end
     end
     return
   end
@@ -623,15 +631,11 @@ f:SetScript("OnEvent", function(self, event, ...)
   end
 
   if event == "ENCOUNTER_END" then
-    local encID, _, _, _, success = ...
-    -- Freeze counting immediately and start the sync+post flow
+    local encID = ...
     if phase ~= "idle" then
-      EndEncounterFreeze(encID)
+      FreezeEncounter(encID)
       HandleEncounterEndPosting()
       C_Timer.After(db.postVisibleSeconds or DEFAULTS.postVisibleSeconds, EndEncounterUI)
-    else
-      -- If we somehow never entered encounter state, still prevent any counting (already idle)
-      -- and do nothing.
     end
     return
   end
