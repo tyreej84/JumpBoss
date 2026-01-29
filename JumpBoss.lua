@@ -4,10 +4,11 @@
 -- At end: ONLY the winner posts the leaderboard.
 --
 -- Small UI defaults (top 5) + timeout fade + class colors (fallback white)
--- Drop-in replacement:
---  - Keeps the nicer spacing between "You: X" and the leaderboard rows
---  - Fixes "missing players" during encounters (accepts updates even if encounterID mismatches due to reload/missed ENCOUNTER_START)
---  - Adds longer default timeout/fade (2 minutes) as requested
+-- Drop-in replacement (v1.0.2 behavior set):
+--  - Leaderboard stays visible ~20s after boss dies (so people can see/paste)
+--  - Keeps spacing between "You: X" and rows
+--  - Accepts updates during active encounter even if encounter IDs mismatch (reload/missed ENCOUNTER_START)
+--  - Extended stale timeout/fade (2 minutes+) as requested
 
 local ADDON_NAME = ...
 local PREFIX = "JBT1"
@@ -30,12 +31,13 @@ local DEFAULTS = {
   broadcastInterval = 0.10,  -- frequent silent updates (throttled)
   heartbeatInterval = 1.25,  -- resend periodically
 
-  -- Extended as requested
   staleTimeout = 120.0,      -- seconds since last update before fading starts
   fadeDuration = 10.0,       -- seconds to fade out before disappearing
 
   claimWindow = 0.60,        -- seconds to wait at encounter end for last updates
   postTopN = 10,             -- top N to include in the final chat post
+
+  postVisibleSeconds = 20.0, -- keep the UI visible after ENCOUNTER_END
 
   pos = { point = "CENTER", relPoint = "CENTER", x = 0, y = 160 },
 }
@@ -144,7 +146,7 @@ local function ResizeUI()
   local lineH = db.lineHeight or DEFAULTS.lineHeight
   local w = db.width or DEFAULTS.width
 
-  -- Header padding increased so "You: X" isn't smashed into the first row
+  -- Header padding so "You: X" isn't smashed into the first row
   local headerH = 26
   local h = headerH + (lines * lineH) + 6
   ui:SetSize(w, h)
@@ -468,9 +470,7 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     if not enc or not count then return end
     if not inEncounter then return end
 
-    -- IMPORTANT FIX:
-    -- Accept updates during our current encounter even if sender's encounterID differs
-    -- (common if they reloaded UI mid-fight and missed ENCOUNTER_START).
+    -- Accept updates during our active encounter even if encounter IDs mismatch.
     totals[sender] = count
     lastSeen[sender] = Now()
     if classFile and classFile ~= "" then
@@ -597,7 +597,9 @@ f:SetScript("OnEvent", function(self, event, ...)
       HandleEncounterEnd()
     end
 
-    C_Timer.After((db.claimWindow or DEFAULTS.claimWindow) + 1.0, function()
+    -- Keep the leaderboard visible for ~20 seconds after boss death
+    local keep = db.postVisibleSeconds or DEFAULTS.postVisibleSeconds or 20.0
+    C_Timer.After((db.claimWindow or DEFAULTS.claimWindow) + keep, function()
       EndEncounter()
     end)
     return
