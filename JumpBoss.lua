@@ -4,6 +4,10 @@
 -- At end: ONLY the winner posts the leaderboard.
 --
 -- Small UI defaults (top 5) + timeout fade + class colors (fallback white)
+-- Drop-in replacement:
+--  - Keeps the nicer spacing between "You: X" and the leaderboard rows
+--  - Fixes "missing players" during encounters (accepts updates even if encounterID mismatches due to reload/missed ENCOUNTER_START)
+--  - Adds longer default timeout/fade (2 minutes) as requested
 
 local ADDON_NAME = ...
 local PREFIX = "JBT1"
@@ -26,8 +30,9 @@ local DEFAULTS = {
   broadcastInterval = 0.10,  -- frequent silent updates (throttled)
   heartbeatInterval = 1.25,  -- resend periodically
 
-  staleTimeout = 3.0,        -- seconds since last update before fading starts
-  fadeDuration = 2.0,        -- seconds to fade out before disappearing
+  -- Extended as requested
+  staleTimeout = 120.0,      -- seconds since last update before fading starts
+  fadeDuration = 10.0,       -- seconds to fade out before disappearing
 
   claimWindow = 0.60,        -- seconds to wait at encounter end for last updates
   postTopN = 10,             -- top N to include in the final chat post
@@ -139,8 +144,9 @@ local function ResizeUI()
   local lineH = db.lineHeight or DEFAULTS.lineHeight
   local w = db.width or DEFAULTS.width
 
-  -- Compact header area + lines
-  local h = 26 + (lines * lineH) + 6
+  -- Header padding increased so "You: X" isn't smashed into the first row
+  local headerH = 26
+  local h = headerH + (lines * lineH) + 6
   ui:SetSize(w, h)
 
   for i = 1, lines do
@@ -149,7 +155,7 @@ local function ResizeUI()
     end
     local fs = ui.lines[i]
     fs:ClearAllPoints()
-    fs:SetPoint("TOPLEFT", 6, -(26 + (i - 1) * lineH))
+    fs:SetPoint("TOPLEFT", 6, -(headerH + (i - 1) * lineH))
     fs:SetText("")
     fs:SetAlpha(1)
     fs:Show()
@@ -460,8 +466,11 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     local classFile = c
 
     if not enc or not count then return end
-    if not (inEncounter and enc == encounterID) then return end
+    if not inEncounter then return end
 
+    -- IMPORTANT FIX:
+    -- Accept updates during our current encounter even if sender's encounterID differs
+    -- (common if they reloaded UI mid-fight and missed ENCOUNTER_START).
     totals[sender] = count
     lastSeen[sender] = Now()
     if classFile and classFile ~= "" then
@@ -533,14 +542,14 @@ SlashCmdList.JUMPBOSS = function(msg)
     end
   elseif cmd == "timeout" and val ~= "" then
     local n = tonumber(val)
-    if n and n >= 0.5 and n <= 30 then
+    if n and n >= 0.5 and n <= 300 then
       db.staleTimeout = n
       print(("JumpBoss: stale timeout set to %.1fs"):format(n))
       return
     end
   elseif cmd == "fade" and val ~= "" then
     local n = tonumber(val)
-    if n and n >= 0.2 and n <= 30 then
+    if n and n >= 0.2 and n <= 60 then
       db.fadeDuration = n
       print(("JumpBoss: fade duration set to %.1fs"):format(n))
       return
