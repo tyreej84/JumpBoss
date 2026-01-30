@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1
+### Changed
+- Updated final leaderboard chat formatting to use:
+  - `PlayerName - X Jumps!`
+  - Includes proper singular/plural (`1 Jump!` vs `2 Jumps!`).
+
 ## 1.2.0
 ### Changed
 - **Non-jumpers are no longer recorded.**
@@ -18,6 +24,7 @@
 - Jump counting stops immediately after boss death.
 - The on-screen leaderboard remains visible for ~20 seconds after the encounter ends.
 - Chat output remains **winner-only** and posts at most once per encounter.
+
 
 ---
 

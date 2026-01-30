@@ -1,5 +1,5 @@
 -- JumpBoss.lua
--- v1.2.0
+-- v1.2.1
 --
 -- Real-time jump leaderboard during boss encounters (addon users only).
 -- Silent addon comms during encounter, ZERO chat until encounter end.
@@ -385,6 +385,10 @@ local function AmIWinnerByTotals()
   return best == myName
 end
 
+local function JumpWord(n)
+  return (n == 1) and "Jump!" or "Jumps!"
+end
+
 local function BuildChatLines()
   local arr = BuildSortedTotalsAll()
   local boss = (encounterName ~= "" and encounterName) or "Boss"
@@ -410,7 +414,7 @@ local function BuildChatLines()
 
   for i = 1, topN do
     local row = arr[i]
-    local chunk = string.format("%d)%s(%d)", i, row.name, row.count)
+    local chunk = string.format("%d) %s - %d %s", i, row.name, row.count, JumpWord(row.count))
     if current == "" then
       current = chunk
     else
