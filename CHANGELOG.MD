@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.2
+### Fixed
+- Fixed `SendChatMessage(): Invalid escape code` by removing pipe (`|`) separators from leaderboard output and sanitizing any pipe characters.
+- Fixed `[ADDON_ACTION_FORBIDDEN] ... SendChatMessage()` issues by posting via `securecallfunction` when available (prevents taint/protected call failures caused by other addons hooking `SendChatMessage`).
+
 ## 1.2.1
 ### Changed
 - Updated final leaderboard chat formatting to use:
@@ -24,6 +29,7 @@
 - Jump counting stops immediately after boss death.
 - The on-screen leaderboard remains visible for ~20 seconds after the encounter ends.
 - Chat output remains **winner-only** and posts at most once per encounter.
+
 
 
 ---

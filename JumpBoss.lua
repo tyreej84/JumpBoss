@@ -1,5 +1,5 @@
 -- JumpBoss.lua
--- v1.2.1
+-- v1.2.2
 --
 -- Real-time jump leaderboard during boss encounters (addon users only).
 -- Silent addon comms during encounter, ZERO chat until encounter end.
@@ -275,30 +275,24 @@ end
 local function SendHello()
   if phase == "idle" then return end
   if Throttled("hello", 2.0) then return end
-  -- HELLO:<enc>:<class>
   SendComm(string.format("HELLO:%d:%s", encounterID, myClass or ""))
 end
 
 local function SendRequest()
   if phase == "idle" then return end
   if Throttled("req", 1.5) then return end
-  -- REQ:<enc>
   SendComm(string.format("REQ:%d", encounterID))
 end
 
 local function SendState()
   if phase == "idle" then return end
-
-  -- IMPORTANT: Non-jumpers are not recorded, so we do not broadcast 0.
   if myJumps <= 0 then return end
-
-  -- S:<enc>:<count>:<class>
   SendComm(string.format("S:%d:%d:%s", encounterID, myJumps, myClass or ""))
 end
 
 local function BroadcastUpdate(force)
   if phase ~= "active" then return end
-  if myJumps <= 0 then return end -- never broadcast until first jump
+  if myJumps <= 0 then return end
 
   local t = Now()
   if not force then
@@ -318,14 +312,11 @@ local function Heartbeat()
   local t = Now()
   if (t - lastHeartbeatAt) < (db.heartbeatInterval or DEFAULTS.heartbeatInterval) then return end
   lastHeartbeatAt = t
-
-  -- Presence handshake; state only if you're a jumper.
   SendHello()
   SendState()
 end
 
 local function SendClaim()
-  -- C:<enc>:<name>:<count>
   SendComm(string.format("C:%d:%s:%d", encounterID, myName, myJumps))
 end
 
@@ -341,9 +332,7 @@ hooksecurefunc("JumpOrAscendStart", function()
   lastJumpAt = t
 
   myJumps = myJumps + 1
-  if myJumps == 1 then
-    jumped[myName] = true
-  end
+  if myJumps == 1 then jumped[myName] = true end
 
   totals[myName] = myJumps
   lastSeen[myName] = t
@@ -389,12 +378,30 @@ local function JumpWord(n)
   return (n == 1) and "Jump!" or "Jumps!"
 end
 
+local function SanitizeForChat(s)
+  if type(s) ~= "string" then return "" end
+  -- Prevent WoW escape parsing ("|c", "|H", etc). A literal pipe must be doubled.
+  s = s:gsub("|", "||")
+  return s
+end
+
+local function SafeSendChatMessage(msg, chatType)
+  msg = SanitizeForChat(msg)
+  if not msg or msg == "" then return end
+
+  -- securecallfunction avoids taint/protected call issues if another addon hooked SendChatMessage.
+  if type(securecallfunction) == "function" then
+    local ok = pcall(securecallfunction, SendChatMessage, msg, chatType)
+    if ok then return end
+  end
+
+  pcall(SendChatMessage, msg, chatType)
+end
+
 local function BuildChatLines()
   local arr = BuildSortedTotalsAll()
   local boss = (encounterName ~= "" and encounterName) or "Boss"
   local total = #arr
-
-  -- If nobody jumped, nobody posts anything.
   if total == 0 then return nil end
 
   local lines = {}
@@ -418,7 +425,8 @@ local function BuildChatLines()
     if current == "" then
       current = chunk
     else
-      local candidate = current .. " | " .. chunk
+      -- IMPORTANT: no " | " here (pipe triggers WoW escape parsing)
+      local candidate = current .. " • " .. chunk
       if #candidate > 240 then
         flush()
         current = chunk
@@ -437,8 +445,9 @@ local function PostToChat(lines)
   if not lines then return end
   local ch = GetGroupChannel()
   if not ch then return end
+
   for _, line in ipairs(lines) do
-    SendChatMessage(line, ch)
+    SafeSendChatMessage(line, ch)
   end
 end
 
@@ -450,7 +459,6 @@ local function HandleEncounterEndPosting()
     if claimWinner then return end
     if not AmIWinnerByTotals() then return end
 
-    -- Claim locally immediately so we don't post before competing claims arrive
     claimWinner = myName
     SendClaim()
 
@@ -481,10 +489,8 @@ local function BeginEncounter(newID, newName)
   pendingBroadcast = false
   claimWinner = nil
 
-  -- Handshake so everyone can exchange state quickly during the fight.
   SendHello()
   SendRequest()
-  -- Do NOT SendState() here (we don't broadcast 0 jumps)
 
   UpdateUI()
 end
@@ -498,7 +504,6 @@ local function FreezeEncounter(encIDFromEvent)
     if encounterName == "" then encounterName = "Encounter" end
   end
 
-  -- Final push if we are a jumper, plus request others one last time.
   SendState()
   SendRequest()
 
@@ -537,9 +542,7 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     local classFile = b or ""
     if phase == "idle" then return end
     if enc ~= encounterID then return end
-
     if classFile ~= "" then classByName[sender] = classFile end
-    -- Reply with our state only if we're a jumper
     SendState()
     return
   end
@@ -548,7 +551,6 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     local enc = tonumber(a) or 0
     if phase == "idle" then return end
     if enc ~= encounterID then return end
-    -- Reply with our state only if we're a jumper
     SendState()
     return
   end
@@ -561,10 +563,7 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     if phase == "idle" then return end
     if enc ~= encounterID then return end
 
-    -- Non-jumpers are not recorded:
-    -- Only accept them once they have at least 1 jump.
     if count <= 0 and not jumped[sender] then
-      -- optionally keep class for coloring if they later jump
       if classFile ~= "" then classByName[sender] = classFile end
       return
     end
@@ -586,7 +585,6 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     if not enc or not winnerName or winnerName == "" or not winnerCount then return end
     if enc ~= encounterID then return end
 
-    -- Arbitration: keep alphabetically smallest claimed winner
     if not claimWinner or winnerName < claimWinner then
       claimWinner = winnerName
     end
@@ -684,7 +682,6 @@ f:SetScript("OnEvent", function(self, event, ...)
   end
 
   if event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
-    -- If we're in an encounter UI state, re-handshake (covers reloads / late joins)
     if phase ~= "idle" then
       SendHello()
       SendRequest()
