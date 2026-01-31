@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.3
+### Fixed
+- Fixed cases where **more than one player** could post the leaderboard.
+  - Added a silent `P:<enc>:<poster>` “posted” lock message.
+  - Winner posting is now staggered with a deterministic delay to avoid simultaneous posts.
+  - Winner is re-validated right before posting to reduce race conditions.
+
 ## 1.2.2
 ### Fixed
 - Fixed `SendChatMessage(): Invalid escape code` by removing pipe (`|`) separators from leaderboard output and sanitizing any pipe characters.

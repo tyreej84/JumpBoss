@@ -1,5 +1,5 @@
 -- JumpBoss.lua
--- v1.2.2
+-- v1.2.3
 --
 -- Real-time jump leaderboard during boss encounters (addon users only).
 -- Silent addon comms during encounter, ZERO chat until encounter end.
@@ -12,6 +12,9 @@
 --  - Waits syncWindow seconds before winner selection + claim arbitration
 --  - Winner-only posts top N (default 5) or fewer if fewer jumpers
 --  - UI remains visible post-kill for postVisibleSeconds (default 20s)
+--
+-- v1.2.3 fix:
+--  - Prevents multiple posters using a POSTED lock message + deterministic post delay.
 
 local ADDON_NAME = ...
 local PREFIX = "JBT1"
@@ -68,6 +71,11 @@ local function PlayerFullName()
   return name or ""
 end
 
+local function ShortName(full)
+  if not full or full == "" then return "" end
+  return Ambiguate(full, "short")
+end
+
 local function Clamp(x, a, b)
   if x < a then return a end
   if x > b then return b end
@@ -91,6 +99,7 @@ local encounterID = 0
 local encounterName = ""
 
 local myName = ""
+local myShort = ""
 local myClass = ""
 local myJumps = 0
 
@@ -103,8 +112,19 @@ local lastBroadcastAt = 0
 local lastHeartbeatAt = 0
 local pendingBroadcast = false
 
-local claimWinner = nil
+-- Winner arbitration / posting lock
+local claimWinner = nil  -- SHORT name (alphabetical tie-break)
+local postedBy = nil     -- SHORT name of the client that already posted
+local postTimer = nil
+
 local lastJumpAt = 0
+
+local function CancelPostTimer()
+  if postTimer and postTimer.Cancel then
+    postTimer:Cancel()
+  end
+  postTimer = nil
+end
 
 -- Throttle for hello/request spam
 local throttle = { hello = 0, req = 0 }
@@ -316,8 +336,15 @@ local function Heartbeat()
   SendState()
 end
 
-local function SendClaim()
-  SendComm(string.format("C:%d:%s:%d", encounterID, myName, myJumps))
+-- Claim winner (SHORT name) and Posted-lock
+local function SendClaim(winnerShort, winnerCount)
+  -- C:<enc>:<winnerShort>:<count>
+  SendComm(string.format("C:%d:%s:%d", encounterID, winnerShort or "", tonumber(winnerCount or 0) or 0))
+end
+
+local function SendPosted(posterShort)
+  -- P:<enc>:<posterShort>
+  SendComm(string.format("P:%d:%s", encounterID, posterShort or ""))
 end
 
 -- -----------------------------
@@ -349,29 +376,27 @@ local function BuildSortedTotalsAll()
   local arr = {}
   for name, count in pairs(totals) do
     if type(count) == "number" and count > 0 then
-      table.insert(arr, { name = name, count = count })
+      table.insert(arr, { name = name, count = count, short = ShortName(name) })
     end
   end
   table.sort(arr, function(a, b)
     if a.count ~= b.count then return a.count > b.count end
-    return a.name < b.name
+    return a.short < b.short
   end)
   return arr
 end
 
-local function AmIWinnerByTotals()
+local function DetermineWinnerShort()
   local arr = BuildSortedTotalsAll()
-  if #arr == 0 then return false end
+  if #arr == 0 then return nil, 0 end
 
   local maxCount = arr[1].count or 0
-  if myJumps ~= maxCount then return false end
-
   local best = nil
   for _, row in ipairs(arr) do
     if row.count ~= maxCount then break end
-    if not best or row.name < best then best = row.name end
+    if not best or row.short < best then best = row.short end
   end
-  return best == myName
+  return best, maxCount
 end
 
 local function JumpWord(n)
@@ -421,7 +446,7 @@ local function BuildChatLines()
 
   for i = 1, topN do
     local row = arr[i]
-    local chunk = string.format("%d) %s - %d %s", i, row.name, row.count, JumpWord(row.count))
+    local chunk = string.format("%d) %s - %d %s", i, row.short, row.count, JumpWord(row.count))
     if current == "" then
       current = chunk
     else
@@ -451,19 +476,52 @@ local function PostToChat(lines)
   end
 end
 
+local function DeterministicDelaySeconds(nameShort)
+  -- 0.35 .. 0.95 seconds based on a small checksum of the short name
+  local sum = 0
+  for i = 1, #nameShort do
+    sum = (sum + string.byte(nameShort, i)) % 1000
+  end
+  return 0.35 + ((sum % 600) / 1000)
+end
+
 local function HandleEncounterEndPosting()
   local window = db.syncWindow or DEFAULTS.syncWindow
   local postDelay = db.claimPostDelay or DEFAULTS.claimPostDelay
 
+  CancelPostTimer()
+  postedBy = nil
+  claimWinner = nil
+
   C_Timer.After(window, function()
-    if claimWinner then return end
-    if not AmIWinnerByTotals() then return end
+    -- If someone already posted, bail.
+    if postedBy then return end
 
-    claimWinner = myName
-    SendClaim()
+    local winnerShort, winnerCount = DetermineWinnerShort()
+    if not winnerShort or winnerCount <= 0 then return end
 
-    C_Timer.After(postDelay, function()
-      if claimWinner ~= myName then return end
+    -- Share claim so everyone can converge on the same winner.
+    SendClaim(winnerShort, winnerCount)
+
+    -- Only the computed winner attempts to post.
+    if winnerShort ~= myShort then return end
+
+    -- Wait a bit for claims/posted to arrive, then add a deterministic stagger.
+    local delay = postDelay + DeterministicDelaySeconds(myShort)
+
+    postTimer = C_Timer.NewTimer(delay, function()
+      postTimer = nil
+
+      -- If someone already posted, bail.
+      if postedBy then return end
+
+      -- Re-check winner right before posting.
+      local finalWinner = select(1, DetermineWinnerShort())
+      if finalWinner ~= myShort then return end
+
+      -- Lock first, then post.
+      postedBy = myShort
+      SendPosted(myShort)
       PostToChat(BuildChatLines())
     end)
   end)
@@ -487,7 +545,10 @@ local function BeginEncounter(newID, newName)
   lastBroadcastAt = 0
   lastHeartbeatAt = 0
   pendingBroadcast = false
+
   claimWinner = nil
+  postedBy = nil
+  CancelPostTimer()
 
   SendHello()
   SendRequest()
@@ -512,6 +573,7 @@ end
 
 local function EndEncounterUI()
   phase = "idle"
+  CancelPostTimer()
   UpdateUI()
 end
 
@@ -580,14 +642,27 @@ local function OnAddonMessage(prefix, msg, channel, sender)
 
   if tag == "C" then
     local enc = tonumber(a)
-    local winnerName = b
+    local winnerShort = b
     local winnerCount = tonumber(c)
-    if not enc or not winnerName or winnerName == "" or not winnerCount then return end
+    if not enc or not winnerShort or winnerShort == "" or not winnerCount then return end
     if enc ~= encounterID then return end
 
-    if not claimWinner or winnerName < claimWinner then
-      claimWinner = winnerName
+    -- Arbitration: keep alphabetically smallest claimed winner (SHORT name)
+    if not claimWinner or winnerShort < claimWinner then
+      claimWinner = winnerShort
     end
+    return
+  end
+
+  if tag == "P" then
+    local enc = tonumber(a)
+    local posterShort = b
+    if not enc or not posterShort or posterShort == "" then return end
+    if enc ~= encounterID then return end
+
+    -- Hard stop: someone posted; cancel any scheduled post.
+    postedBy = posterShort
+    CancelPostTimer()
     return
   end
 end
@@ -643,6 +718,7 @@ f:SetScript("OnEvent", function(self, event, ...)
     if name ~= ADDON_NAME then return end
 
     myName = PlayerFullName()
+    myShort = ShortName(myName)
     local _, classFile = UnitClass("player")
     myClass = classFile or ""
 
