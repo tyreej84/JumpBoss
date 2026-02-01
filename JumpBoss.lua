@@ -1,20 +1,10 @@
 -- JumpBoss.lua
--- v1.2.3
+-- v1.2.4
 --
--- Real-time jump leaderboard during boss encounters (addon users only).
--- Silent addon comms during encounter, ZERO chat until encounter end.
--- At end: ONLY the winner posts the leaderboard.
---
--- Key behaviors:
---  - Interactive real-time updates during encounters via HELLO/REQ/STATE handshake
---  - NON-JUMPERS ARE NOT RECORDED (never shown, never posted)
---  - Jump counting stops immediately on ENCOUNTER_END
---  - Waits syncWindow seconds before winner selection + claim arbitration
---  - Winner-only posts top N (default 5) or fewer if fewer jumpers
---  - UI remains visible post-kill for postVisibleSeconds (default 20s)
---
--- v1.2.3 fix:
---  - Prevents multiple posters using a POSTED lock message + deterministic post delay.
+-- Fixes:
+--  - Avoids protected/taint issues by using C_ChatInfo.SendChatMessage (not global SendChatMessage)
+--  - Hard-sanitizes any '|' to '||' to prevent "Invalid escape code" errors
+--  - Keeps winner-only posting with POSTED lock + deterministic stagger
 
 local ADDON_NAME = ...
 local PREFIX = "JBT1"
@@ -34,17 +24,17 @@ local DEFAULTS = {
   width = 160,
   lineHeight = 13,
 
-  broadcastInterval = 0.10,   -- throttle for sending state updates on jump spam
-  heartbeatInterval = 1.25,   -- periodic presence + state resend
+  broadcastInterval = 0.10,
+  heartbeatInterval = 1.25,
 
-  staleTimeout = 120.0,       -- purely visual fade for jumpers who stop sending
+  staleTimeout = 120.0,
   fadeDuration = 10.0,
 
-  syncWindow = 5.0,           -- seconds after encounter end to gather final totals
-  claimPostDelay = 1.00,      -- extra time to let claim messages arrive
-  postVisibleSeconds = 20.0,  -- keep UI up after encounter end
+  syncWindow = 5.0,
+  claimPostDelay = 1.00,
+  postVisibleSeconds = 20.0,
 
-  postTopN = 5,               -- final chat top N (min 5 enforced)
+  postTopN = 5, -- min 5 enforced
 
   pos = { point = "CENTER", relPoint = "CENTER", x = 0, y = 160 },
 }
@@ -82,7 +72,6 @@ local function Clamp(x, a, b)
   return x
 end
 
--- BreakTimerLite-style: pick ONE correct channel
 local function GetGroupChannel()
   if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then return "INSTANCE_CHAT" end
   if IsInRaid() then return "RAID" end
@@ -93,8 +82,7 @@ end
 -- -----------------------------
 -- State
 -- -----------------------------
--- phase: "idle" | "active" | "ended"
-local phase = "idle"
+local phase = "idle" -- "idle" | "active" | "ended"
 local encounterID = 0
 local encounterName = ""
 
@@ -103,26 +91,24 @@ local myShort = ""
 local myClass = ""
 local myJumps = 0
 
-local totals = {}      -- name -> jumps (ONLY jumpers)
-local lastSeen = {}    -- name -> timestamp
-local classByName = {} -- name -> classFile (for coloring)
-local jumped = {}      -- name -> true once they've jumped at least once
+local totals = {}      -- fullName -> jumps (ONLY jumpers)
+local lastSeen = {}    -- fullName -> timestamp
+local classByName = {} -- fullName -> classFile
+local jumped = {}      -- fullName -> true once jumped
 
 local lastBroadcastAt = 0
 local lastHeartbeatAt = 0
 local pendingBroadcast = false
 
--- Winner arbitration / posting lock
-local claimWinner = nil  -- SHORT name (alphabetical tie-break)
-local postedBy = nil     -- SHORT name of the client that already posted
+-- winner arbitration / posting lock (SHORT names)
+local claimWinner = nil
+local postedBy = nil
 local postTimer = nil
 
 local lastJumpAt = 0
 
 local function CancelPostTimer()
-  if postTimer and postTimer.Cancel then
-    postTimer:Cancel()
-  end
+  if postTimer and postTimer.Cancel then postTimer:Cancel() end
   postTimer = nil
 end
 
@@ -272,7 +258,7 @@ local function UpdateUI()
         alpha = Clamp(alpha, 0, 1)
       end
       local r, g, b = NameColor(row.name)
-      fs:SetText(string.format("%d. %s %d", i, row.name, row.count))
+      fs:SetText(string.format("%d. %s %d", i, ShortName(row.name), row.count))
       fs:SetTextColor(r, g, b, 1)
       fs:SetAlpha(alpha)
     else
@@ -291,7 +277,6 @@ local function SendComm(msg)
   C_ChatInfo.SendAddonMessage(PREFIX, msg, ch)
 end
 
--- HELLO/REQ/STATE
 local function SendHello()
   if phase == "idle" then return end
   if Throttled("hello", 2.0) then return end
@@ -336,19 +321,16 @@ local function Heartbeat()
   SendState()
 end
 
--- Claim winner (SHORT name) and Posted-lock
 local function SendClaim(winnerShort, winnerCount)
-  -- C:<enc>:<winnerShort>:<count>
   SendComm(string.format("C:%d:%s:%d", encounterID, winnerShort or "", tonumber(winnerCount or 0) or 0))
 end
 
 local function SendPosted(posterShort)
-  -- P:<enc>:<posterShort>
   SendComm(string.format("P:%d:%s", encounterID, posterShort or ""))
 end
 
 -- -----------------------------
--- Jump detection (ONLY during active)
+-- Jump detection
 -- -----------------------------
 hooksecurefunc("JumpOrAscendStart", function()
   if phase ~= "active" then return end
@@ -405,22 +387,15 @@ end
 
 local function SanitizeForChat(s)
   if type(s) ~= "string" then return "" end
-  -- Prevent WoW escape parsing ("|c", "|H", etc). A literal pipe must be doubled.
-  s = s:gsub("|", "||")
-  return s
+  -- Any literal pipe must be doubled or WoW treats it as an escape sequence.
+  return s:gsub("|", "||")
 end
 
-local function SafeSendChatMessage(msg, chatType)
+local function SafeSendChat(msg, chatType)
   msg = SanitizeForChat(msg)
-  if not msg or msg == "" then return end
-
-  -- securecallfunction avoids taint/protected call issues if another addon hooked SendChatMessage.
-  if type(securecallfunction) == "function" then
-    local ok = pcall(securecallfunction, SendChatMessage, msg, chatType)
-    if ok then return end
-  end
-
-  pcall(SendChatMessage, msg, chatType)
+  if msg == "" then return end
+  if not (C_ChatInfo and C_ChatInfo.SendChatMessage) then return end
+  pcall(C_ChatInfo.SendChatMessage, msg, chatType)
 end
 
 local function BuildChatLines()
@@ -450,7 +425,6 @@ local function BuildChatLines()
     if current == "" then
       current = chunk
     else
-      -- IMPORTANT: no " | " here (pipe triggers WoW escape parsing)
       local candidate = current .. " • " .. chunk
       if #candidate > 240 then
         flush()
@@ -470,19 +444,17 @@ local function PostToChat(lines)
   if not lines then return end
   local ch = GetGroupChannel()
   if not ch then return end
-
   for _, line in ipairs(lines) do
-    SafeSendChatMessage(line, ch)
+    SafeSendChat(line, ch)
   end
 end
 
 local function DeterministicDelaySeconds(nameShort)
-  -- 0.35 .. 0.95 seconds based on a small checksum of the short name
   local sum = 0
   for i = 1, #nameShort do
     sum = (sum + string.byte(nameShort, i)) % 1000
   end
-  return 0.35 + ((sum % 600) / 1000)
+  return 0.35 + ((sum % 600) / 1000) -- 0.35 .. 0.95
 end
 
 local function HandleEncounterEndPosting()
@@ -494,32 +466,22 @@ local function HandleEncounterEndPosting()
   claimWinner = nil
 
   C_Timer.After(window, function()
-    -- If someone already posted, bail.
     if postedBy then return end
 
     local winnerShort, winnerCount = DetermineWinnerShort()
     if not winnerShort or winnerCount <= 0 then return end
 
-    -- Share claim so everyone can converge on the same winner.
     SendClaim(winnerShort, winnerCount)
-
-    -- Only the computed winner attempts to post.
     if winnerShort ~= myShort then return end
 
-    -- Wait a bit for claims/posted to arrive, then add a deterministic stagger.
     local delay = postDelay + DeterministicDelaySeconds(myShort)
-
     postTimer = C_Timer.NewTimer(delay, function()
       postTimer = nil
-
-      -- If someone already posted, bail.
       if postedBy then return end
 
-      -- Re-check winner right before posting.
       local finalWinner = select(1, DetermineWinnerShort())
       if finalWinner ~= myShort then return end
 
-      -- Lock first, then post.
       postedBy = myShort
       SendPosted(myShort)
       PostToChat(BuildChatLines())
@@ -552,7 +514,6 @@ local function BeginEncounter(newID, newName)
 
   SendHello()
   SendRequest()
-
   UpdateUI()
 end
 
@@ -567,7 +528,6 @@ local function FreezeEncounter(encIDFromEvent)
 
   SendState()
   SendRequest()
-
   UpdateUI()
 end
 
@@ -647,7 +607,6 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     if not enc or not winnerShort or winnerShort == "" or not winnerCount then return end
     if enc ~= encounterID then return end
 
-    -- Arbitration: keep alphabetically smallest claimed winner (SHORT name)
     if not claimWinner or winnerShort < claimWinner then
       claimWinner = winnerShort
     end
@@ -660,7 +619,6 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     if not enc or not posterShort or posterShort == "" then return end
     if enc ~= encounterID then return end
 
-    -- Hard stop: someone posted; cancel any scheduled post.
     postedBy = posterShort
     CancelPostTimer()
     return
@@ -773,7 +731,6 @@ f:RegisterEvent("ENCOUNTER_END")
 f:RegisterEvent("GROUP_ROSTER_UPDATE")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
 
--- Tick
 ui:SetScript("OnUpdate", function(self, elapsed)
   if phase == "idle" then return end
 
