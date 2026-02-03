@@ -1,10 +1,11 @@
 -- JumpBoss.lua
--- v1.2.4
+-- v1.2.5
 --
 -- Fixes:
---  - Avoids protected/taint issues by using C_ChatInfo.SendChatMessage (not global SendChatMessage)
---  - Hard-sanitizes any '|' to '||' to prevent "Invalid escape code" errors
---  - Keeps winner-only posting with POSTED lock + deterministic stagger
+--  - FIX live updates: choose RAID first (prevents RAID vs INSTANCE_CHAT split)
+--  - Keeps: C_ChatInfo.SendChatMessage for taint avoidance
+--  - Keeps: hard-sanitize '|' to '||' to prevent "Invalid escape code"
+--  - Keeps: winner-only posting with POSTED lock + deterministic stagger
 
 local ADDON_NAME = ...
 local PREFIX = "JBT1"
@@ -72,9 +73,12 @@ local function Clamp(x, a, b)
   return x
 end
 
+-- IMPORTANT:
+-- Prefer RAID first so everyone in a raid uses the same channel.
+-- Then INSTANCE_CHAT for LFG/instance parties, then PARTY.
 local function GetGroupChannel()
-  if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then return "INSTANCE_CHAT" end
   if IsInRaid() then return "RAID" end
+  if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then return "INSTANCE_CHAT" end
   if IsInGroup() then return "PARTY" end
   return nil
 end
@@ -387,15 +391,21 @@ end
 
 local function SanitizeForChat(s)
   if type(s) ~= "string" then return "" end
-  -- Any literal pipe must be doubled or WoW treats it as an escape sequence.
   return s:gsub("|", "||")
 end
 
 local function SafeSendChat(msg, chatType)
   msg = SanitizeForChat(msg)
   if msg == "" then return end
-  if not (C_ChatInfo and C_ChatInfo.SendChatMessage) then return end
-  pcall(C_ChatInfo.SendChatMessage, msg, chatType)
+
+  -- Prefer the safe API (avoids your BreakTimerLite SendChatMessage hook/taint)
+  if C_ChatInfo and C_ChatInfo.SendChatMessage then
+    pcall(C_ChatInfo.SendChatMessage, msg, chatType)
+    return
+  end
+
+  -- Fallback (still protected with pcall)
+  pcall(SendChatMessage, msg, chatType)
 end
 
 local function BuildChatLines()

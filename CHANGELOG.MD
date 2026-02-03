@@ -1,4 +1,32 @@
-# Changelog
+## 1.2.5
+### Fixed
+- Fixed remaining cases where **multiple players could still post** the leaderboard:
+  - Final posting now uses **winner-only deterministic arbitration** with:
+    - A shared `C:<enc>:<winner>` claim
+    - A hard `P:<enc>:<poster>` posted-lock
+    - Deterministic per-player delay to prevent simultaneous posts
+  - All scheduled post timers are cancelled immediately once a `P:` message is received.
+- Fixed chat posting taint issues permanently:
+  - All chat output now uses `C_ChatInfo.SendChatMessage` exclusively.
+  - No calls to the global `SendChatMessage` remain.
+- Fixed “Invalid escape code” errors:
+  - All outgoing chat lines are fully sanitized (`|` → `||`) before posting.
+
+### Improved
+- End-of-encounter sync is more reliable:
+  - Clients wait for a full sync window before resolving the winner.
+  - Winner is re-validated immediately before posting to avoid stale data.
+- Short names (`Name-Realm` → `Name`) are now consistently used in chat output.
+
+---
+
+## 1.2.4
+### Fixed
+- Fixed chat taint/protection errors when posting results:
+  - JumpBoss now posts via `C_ChatInfo.SendChatMessage` (avoids tainted global `SendChatMessage`).
+- Prevented “Invalid escape code” chat errors by sanitizing `|` as `||` in all outgoing messages.
+
+---
 
 ## 1.2.3
 ### Fixed
@@ -7,16 +35,22 @@
   - Winner posting is now staggered with a deterministic delay to avoid simultaneous posts.
   - Winner is re-validated right before posting to reduce race conditions.
 
+---
+
 ## 1.2.2
 ### Fixed
 - Fixed `SendChatMessage(): Invalid escape code` by removing pipe (`|`) separators from leaderboard output and sanitizing any pipe characters.
 - Fixed `[ADDON_ACTION_FORBIDDEN] ... SendChatMessage()` issues by posting via `securecallfunction` when available (prevents taint/protected call failures caused by other addons hooking `SendChatMessage`).
+
+---
 
 ## 1.2.1
 ### Changed
 - Updated final leaderboard chat formatting to use:
   - `PlayerName - X Jumps!`
   - Includes proper singular/plural (`1 Jump!` vs `2 Jumps!`).
+
+---
 
 ## 1.2.0
 ### Changed
@@ -36,8 +70,6 @@
 - Jump counting stops immediately after boss death.
 - The on-screen leaderboard remains visible for ~20 seconds after the encounter ends.
 - Chat output remains **winner-only** and posts at most once per encounter.
-
-
 
 ---
 
