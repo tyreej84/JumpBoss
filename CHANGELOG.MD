@@ -1,3 +1,32 @@
+## 1.2.6
+### Fixed
+- Fixed addon communication desync during encounters:
+  - All addon messages now consistently use a **single shared channel per group type** (RAID → INSTANCE_CHAT → PARTY).
+  - Prevents split-brain scenarios where different clients believed they were alone or the winner.
+- Fixed cases where **multiple players could still post** after wipes:
+  - Winner arbitration now fully converges before any post is allowed.
+  - Clients that do not receive complete state data will no longer post.
+- Fixed missing or incomplete participant data in end-of-encounter results:
+  - Final leaderboard now reflects the full synced state, not partial local totals.
+
+### Improved
+- Real-time leaderboard updates during encounters:
+  - State broadcasts are now reliably received mid-fight, allowing the on-screen leaderboard to update live.
+  - HELLO / REQ / STATE handshake reliability improved for raids, wipes, reloads, and late joins.
+- End-of-encounter behavior clarified and stabilized:
+  - Leaderboard posts on both **kills and wipes**, but still **winner-only**.
+  - Posting is delayed until synchronization completes, ensuring correct totals.
+- Chat output formatting consistency:
+  - Leaderboard entries are posted **one player per line** for readability.
+  - Uses short names (`Name` instead of `Name-Realm`) consistently.
+
+### Notes
+- JumpBoss remains fully peer-to-peer:
+  - There is **no host or leader** — all clients participate equally.
+  - Deterministic arbitration guarantees only one poster.
+- Jump counting still stops immediately on encounter end.
+- The on-screen leaderboard remains visible for the configured post-encounter duration.
+
 ## 1.2.5
 ### Fixed
 - Fixed remaining cases where **multiple players could still post** the leaderboard:

@@ -1,11 +1,18 @@
 -- JumpBoss.lua
--- v1.2.5
+-- v1.2.6
 --
--- Fixes:
---  - FIX live updates: choose RAID first (prevents RAID vs INSTANCE_CHAT split)
---  - Keeps: C_ChatInfo.SendChatMessage for taint avoidance
---  - Keeps: hard-sanitize '|' to '||' to prevent "Invalid escape code"
---  - Keeps: winner-only posting with POSTED lock + deterministic stagger
+-- Fixes / Improvements:
+--  - Live updates: uses PLAYER_JUMP (reliable) + debounced hook fallback
+--  - Live updates: periodic REQ pulse during encounter to recover missed state
+--  - Posting: posts on BOTH wipes and kills (ENCOUNTER_END), winner-only
+--  - Posting: claim arbitration is authoritative + POSTED lock cancels others
+--  - Chat: one player per line (plus header)
+--  - Safety: avoids taint/protection by using securecallfunction + C_ChatInfo.SendChatMessage
+--  - Safety: hard-sanitizes '|' -> '||' to avoid invalid escape codes
+--
+-- Notes:
+--  - Tracks only JumpBoss users who jumped at least once.
+--  - Comms channel: RAID first, then INSTANCE_CHAT, then PARTY.
 
 local ADDON_NAME = ...
 local PREFIX = "JBT1"
@@ -34,6 +41,8 @@ local DEFAULTS = {
   syncWindow = 5.0,
   claimPostDelay = 1.00,
   postVisibleSeconds = 20.0,
+
+  reqPulseInterval = 3.0, -- periodic REQ during encounter to improve live updates
 
   postTopN = 5, -- min 5 enforced
 
@@ -89,6 +98,7 @@ end
 local phase = "idle" -- "idle" | "active" | "ended"
 local encounterID = 0
 local encounterName = ""
+local encounterSuccess = nil -- boolean from ENCOUNTER_END if available
 
 local myName = ""
 local myShort = ""
@@ -104,9 +114,12 @@ local lastBroadcastAt = 0
 local lastHeartbeatAt = 0
 local pendingBroadcast = false
 
--- winner arbitration / posting lock (SHORT names)
-local claimWinner = nil
-local postedBy = nil
+local lastReqPulseAt = 0
+
+-- Winner arbitration / posting lock (FULL names for determinism)
+local claimWinnerFull = nil
+local claimWinnerCount = 0
+local postedByFull = nil
 local postTimer = nil
 
 local lastJumpAt = 0
@@ -325,18 +338,31 @@ local function Heartbeat()
   SendState()
 end
 
-local function SendClaim(winnerShort, winnerCount)
-  SendComm(string.format("C:%d:%s:%d", encounterID, winnerShort or "", tonumber(winnerCount or 0) or 0))
+local function ReqPulse()
+  if phase ~= "active" then return end
+  local t = Now()
+  local interval = db.reqPulseInterval or DEFAULTS.reqPulseInterval
+  if (t - lastReqPulseAt) < interval then return end
+  lastReqPulseAt = t
+  -- REQ helps pull in late joiners / missed STATEs
+  SendRequest()
 end
 
-local function SendPosted(posterShort)
-  SendComm(string.format("P:%d:%s", encounterID, posterShort or ""))
+-- Claims / Posted lock
+local function SendClaim(winnerFull, winnerCount)
+  -- C:<enc>:<winnerFull>:<count>
+  SendComm(string.format("C:%d:%s:%d", encounterID, winnerFull or "", tonumber(winnerCount or 0) or 0))
+end
+
+local function SendPosted(posterFull)
+  -- P:<enc>:<posterFull>
+  SendComm(string.format("P:%d:%s", encounterID, posterFull or ""))
 end
 
 -- -----------------------------
 -- Jump detection
 -- -----------------------------
-hooksecurefunc("JumpOrAscendStart", function()
+local function OnJumpDetected()
   if phase ~= "active" then return end
   if UnitInVehicle("player") or UnitOnTaxi("player") then return end
 
@@ -353,6 +379,12 @@ hooksecurefunc("JumpOrAscendStart", function()
 
   BroadcastUpdate(false)
   UpdateUI()
+end
+
+-- Primary: PLAYER_JUMP (most reliable)
+-- Fallback: JumpOrAscendStart hook (kept, debounced, safe)
+hooksecurefunc("JumpOrAscendStart", function()
+  OnJumpDetected()
 end)
 
 -- -----------------------------
@@ -367,22 +399,15 @@ local function BuildSortedTotalsAll()
   end
   table.sort(arr, function(a, b)
     if a.count ~= b.count then return a.count > b.count end
-    return a.short < b.short
+    return a.name < b.name
   end)
   return arr
 end
 
-local function DetermineWinnerShort()
+local function DetermineLocalWinner()
   local arr = BuildSortedTotalsAll()
   if #arr == 0 then return nil, 0 end
-
-  local maxCount = arr[1].count or 0
-  local best = nil
-  for _, row in ipairs(arr) do
-    if row.count ~= maxCount then break end
-    if not best or row.short < best then best = row.short end
-  end
-  return best, maxCount
+  return arr[1].name, arr[1].count or 0
 end
 
 local function JumpWord(n)
@@ -397,56 +422,40 @@ end
 local function SafeSendChat(msg, chatType)
   msg = SanitizeForChat(msg)
   if msg == "" then return end
+  if not (C_ChatInfo and C_ChatInfo.SendChatMessage) then return end
 
-  -- Prefer the safe API (avoids your BreakTimerLite SendChatMessage hook/taint)
-  if C_ChatInfo and C_ChatInfo.SendChatMessage then
+  -- Prefer securecallfunction when available; do NOT fall back to global SendChatMessage.
+  if type(securecallfunction) == "function" then
+    pcall(securecallfunction, C_ChatInfo.SendChatMessage, msg, chatType)
+  else
     pcall(C_ChatInfo.SendChatMessage, msg, chatType)
-    return
   end
-
-  -- Fallback (still protected with pcall)
-  pcall(SendChatMessage, msg, chatType)
 end
 
 local function BuildChatLines()
   local arr = BuildSortedTotalsAll()
-  local boss = (encounterName ~= "" and encounterName) or "Boss"
   local total = #arr
   if total == 0 then return nil end
 
+  local boss = (encounterName ~= "" and encounterName) or "Boss"
+  local suffix = ""
+  if encounterSuccess ~= nil then
+    suffix = encounterSuccess and " (Kill)" or " (Wipe)"
+  end
+
   local lines = {}
-  table.insert(lines, string.format("Jump Leaderboard - %s", boss))
+  table.insert(lines, string.format("Jump Leaderboard - %s%s", boss, suffix))
 
   local configured = tonumber(db.postTopN or DEFAULTS.postTopN or 5) or 5
   if configured < 5 then configured = 5 end
   local topN = math.min(configured, total)
 
-  local current = ""
-  local function flush()
-    if current ~= "" then
-      table.insert(lines, current)
-      current = ""
-    end
-  end
-
+  -- One player per line (as requested)
   for i = 1, topN do
     local row = arr[i]
-    local chunk = string.format("%d) %s - %d %s", i, row.short, row.count, JumpWord(row.count))
-    if current == "" then
-      current = chunk
-    else
-      local candidate = current .. " • " .. chunk
-      if #candidate > 240 then
-        flush()
-        current = chunk
-      else
-        current = candidate
-      end
-    end
+    table.insert(lines, string.format("%d) %s - %d %s", i, row.short, row.count, JumpWord(row.count)))
   end
-  flush()
 
-  table.insert(lines, "(Counts only players with JumpBoss who jumped at least once.)")
   return lines
 end
 
@@ -459,42 +468,85 @@ local function PostToChat(lines)
   end
 end
 
-local function DeterministicDelaySeconds(nameShort)
+local function DeterministicDelaySeconds(key)
+  -- 0.35 .. 0.95 seconds based on checksum of a stable string (full name)
   local sum = 0
-  for i = 1, #nameShort do
-    sum = (sum + string.byte(nameShort, i)) % 1000
+  for i = 1, #key do
+    sum = (sum + string.byte(key, i)) % 1000
   end
-  return 0.35 + ((sum % 600) / 1000) -- 0.35 .. 0.95
+  return 0.35 + ((sum % 600) / 1000)
+end
+
+local function ConsiderClaim(winnerFull, winnerCount)
+  winnerFull = winnerFull or ""
+  winnerCount = tonumber(winnerCount or 0) or 0
+  if winnerFull == "" or winnerCount <= 0 then return end
+
+  -- Keep best by: higher count, then alphabetical full name
+  if not claimWinnerFull then
+    claimWinnerFull = winnerFull
+    claimWinnerCount = winnerCount
+    return
+  end
+
+  if winnerCount > (claimWinnerCount or 0) then
+    claimWinnerFull = winnerFull
+    claimWinnerCount = winnerCount
+  elseif winnerCount == (claimWinnerCount or 0) and winnerFull < claimWinnerFull then
+    claimWinnerFull = winnerFull
+    claimWinnerCount = winnerCount
+  end
+end
+
+local function FinalWinnerFull()
+  -- Prefer claim-based convergence; fall back to local if no claims
+  if claimWinnerFull and claimWinnerFull ~= "" and (claimWinnerCount or 0) > 0 then
+    return claimWinnerFull, claimWinnerCount
+  end
+  return DetermineLocalWinner()
 end
 
 local function HandleEncounterEndPosting()
   local window = db.syncWindow or DEFAULTS.syncWindow
-  local postDelay = db.claimPostDelay or DEFAULTS.claimPostDelay
+  local gather = db.claimPostDelay or DEFAULTS.claimPostDelay
 
   CancelPostTimer()
-  postedBy = nil
-  claimWinner = nil
+  postedByFull = nil
+  claimWinnerFull = nil
+  claimWinnerCount = 0
 
   C_Timer.After(window, function()
-    if postedBy then return end
+    if postedByFull then return end
 
-    local winnerShort, winnerCount = DetermineWinnerShort()
-    if not winnerShort or winnerCount <= 0 then return end
+    -- Send my local claim to help everyone converge
+    local localWinner, localCount = DetermineLocalWinner()
+    if not localWinner or localCount <= 0 then return end
+    SendClaim(localWinner, localCount)
 
-    SendClaim(winnerShort, winnerCount)
-    if winnerShort ~= myShort then return end
+    -- Give time for claims to arrive before selecting final winner
+    C_Timer.After(gather, function()
+      if postedByFull then return end
 
-    local delay = postDelay + DeterministicDelaySeconds(myShort)
-    postTimer = C_Timer.NewTimer(delay, function()
-      postTimer = nil
-      if postedBy then return end
+      local winnerFull = select(1, FinalWinnerFull())
+      if not winnerFull or winnerFull == "" then return end
 
-      local finalWinner = select(1, DetermineWinnerShort())
-      if finalWinner ~= myShort then return end
+      -- Only the final winner attempts to post
+      if winnerFull ~= myName then return end
 
-      postedBy = myShort
-      SendPosted(myShort)
-      PostToChat(BuildChatLines())
+      local delay = DeterministicDelaySeconds(myName)
+      postTimer = C_Timer.NewTimer(delay, function()
+        postTimer = nil
+        if postedByFull then return end
+
+        -- Re-check final winner right before posting
+        local finalWinner = select(1, FinalWinnerFull())
+        if finalWinner ~= myName then return end
+
+        -- Lock first, then post
+        postedByFull = myName
+        SendPosted(myName)
+        PostToChat(BuildChatLines())
+      end)
     end)
   end)
 end
@@ -506,6 +558,7 @@ local function BeginEncounter(newID, newName)
   phase = "active"
   encounterID = newID or 0
   encounterName = newName or "Encounter"
+  encounterSuccess = nil
 
   myJumps = 0
 
@@ -517,9 +570,11 @@ local function BeginEncounter(newID, newName)
   lastBroadcastAt = 0
   lastHeartbeatAt = 0
   pendingBroadcast = false
+  lastReqPulseAt = 0
 
-  claimWinner = nil
-  postedBy = nil
+  claimWinnerFull = nil
+  claimWinnerCount = 0
+  postedByFull = nil
   CancelPostTimer()
 
   SendHello()
@@ -527,7 +582,7 @@ local function BeginEncounter(newID, newName)
   UpdateUI()
 end
 
-local function FreezeEncounter(encIDFromEvent)
+local function FreezeEncounter(encIDFromEvent, successFlag)
   phase = "ended"
   pendingBroadcast = false
 
@@ -536,6 +591,9 @@ local function FreezeEncounter(encIDFromEvent)
     if encounterName == "" then encounterName = "Encounter" end
   end
 
+  encounterSuccess = (successFlag == 1) and true or ((successFlag == 0) and false or encounterSuccess)
+
+  -- Final push + pull
   SendState()
   SendRequest()
   UpdateUI()
@@ -612,24 +670,23 @@ local function OnAddonMessage(prefix, msg, channel, sender)
 
   if tag == "C" then
     local enc = tonumber(a)
-    local winnerShort = b
+    local winnerFull = b
     local winnerCount = tonumber(c)
-    if not enc or not winnerShort or winnerShort == "" or not winnerCount then return end
+    if not enc or not winnerFull or winnerFull == "" or not winnerCount then return end
     if enc ~= encounterID then return end
 
-    if not claimWinner or winnerShort < claimWinner then
-      claimWinner = winnerShort
-    end
+    ConsiderClaim(winnerFull, winnerCount)
     return
   end
 
   if tag == "P" then
     local enc = tonumber(a)
-    local posterShort = b
-    if not enc or not posterShort or posterShort == "" then return end
+    local posterFull = b
+    if not enc or not posterFull or posterFull == "" then return end
     if enc ~= encounterID then return end
 
-    postedBy = posterShort
+    -- Hard stop: someone posted; cancel any scheduled post.
+    postedByFull = posterFull
     CancelPostTimer()
     return
   end
@@ -701,11 +758,20 @@ f:SetScript("OnEvent", function(self, event, ...)
     C_ChatInfo.RegisterAddonMessagePrefix(PREFIX)
     ApplyUISettings()
     UpdateUI()
+
+    -- Prefer PLAYER_JUMP for reliable jump detection
+    f:RegisterEvent("PLAYER_JUMP")
+    return
+  end
+
+  if event == "PLAYER_JUMP" then
+    OnJumpDetected()
     return
   end
 
   if event == "CHAT_MSG_ADDON" then
-    OnAddonMessage(...)
+    local pfx, msg, ch, sender = ...
+    OnAddonMessage(pfx, msg, ch, sender)
     return
   end
 
@@ -716,9 +782,9 @@ f:SetScript("OnEvent", function(self, event, ...)
   end
 
   if event == "ENCOUNTER_END" then
-    local encID = ...
+    local encID, encName, difficultyID, groupSize, success = ...
     if phase ~= "idle" then
-      FreezeEncounter(encID)
+      FreezeEncounter(encID, success)
       HandleEncounterEndPosting()
       C_Timer.After(db.postVisibleSeconds or DEFAULTS.postVisibleSeconds, EndEncounterUI)
     end
@@ -749,6 +815,7 @@ ui:SetScript("OnUpdate", function(self, elapsed)
       BroadcastUpdate(false)
     end
     Heartbeat()
+    ReqPulse()
   end
 
   UpdateUI()
