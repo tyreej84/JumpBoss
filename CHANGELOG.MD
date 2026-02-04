@@ -1,3 +1,9 @@
+# Changelog
+
+All notable changes to **JumpBoss** are documented in this file.
+
+---
+
 ## 1.2.6
 ### Fixed
 - Fixed addon communication desync during encounters:
