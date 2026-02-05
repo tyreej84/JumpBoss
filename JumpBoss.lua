@@ -1,5 +1,5 @@
 -- JumpBoss.lua
--- v1.2.6
+-- v1.2.7
 --
 -- Fixes / Improvements:
 --  - Live updates: uses PLAYER_JUMP (reliable) + debounced hook fallback
@@ -13,6 +13,11 @@
 -- Notes:
 --  - Tracks only JumpBoss users who jumped at least once.
 --  - Comms channel: RAID first, then INSTANCE_CHAT, then PARTY.
+--
+-- Additional hard fixes in this drop-in:
+--  - SafeSendChat now ALWAYS falls back to pcall(C_ChatInfo.SendChatMessage) if securecallfunction is missing/fails
+--  - Jump debounce widened to avoid double-counting when PLAYER_JUMP and JumpOrAscendStart both fire
+--  - Local claim is applied to the claim pool (ConsiderClaim) to improve convergence even if other claims are delayed/lost
 
 local ADDON_NAME = ...
 local PREFIX = "JBT1"
@@ -290,7 +295,7 @@ end
 -- -----------------------------
 local function SendComm(msg)
   local ch = GetGroupChannel()
-  if not ch then return end
+  if not ch or not C_ChatInfo then return end
   C_ChatInfo.SendAddonMessage(PREFIX, msg, ch)
 end
 
@@ -344,18 +349,15 @@ local function ReqPulse()
   local interval = db.reqPulseInterval or DEFAULTS.reqPulseInterval
   if (t - lastReqPulseAt) < interval then return end
   lastReqPulseAt = t
-  -- REQ helps pull in late joiners / missed STATEs
   SendRequest()
 end
 
 -- Claims / Posted lock
 local function SendClaim(winnerFull, winnerCount)
-  -- C:<enc>:<winnerFull>:<count>
   SendComm(string.format("C:%d:%s:%d", encounterID, winnerFull or "", tonumber(winnerCount or 0) or 0))
 end
 
 local function SendPosted(posterFull)
-  -- P:<enc>:<posterFull>
   SendComm(string.format("P:%d:%s", encounterID, posterFull or ""))
 end
 
@@ -367,7 +369,8 @@ local function OnJumpDetected()
   if UnitInVehicle("player") or UnitOnTaxi("player") then return end
 
   local t = Now()
-  if (t - lastJumpAt) < 0.08 then return end
+  -- widened debounce to avoid double counting when PLAYER_JUMP and JumpOrAscendStart both fire
+  if (t - lastJumpAt) < 0.20 then return end
   lastJumpAt = t
 
   myJumps = myJumps + 1
@@ -381,8 +384,7 @@ local function OnJumpDetected()
   UpdateUI()
 end
 
--- Primary: PLAYER_JUMP (most reliable)
--- Fallback: JumpOrAscendStart hook (kept, debounced, safe)
+-- Fallback hook (kept) - debounced by OnJumpDetected
 hooksecurefunc("JumpOrAscendStart", function()
   OnJumpDetected()
 end)
@@ -399,7 +401,7 @@ local function BuildSortedTotalsAll()
   end
   table.sort(arr, function(a, b)
     if a.count ~= b.count then return a.count > b.count end
-    return a.name < b.name
+    return a.name < b.name -- full-name tie-break for determinism across realms
   end)
   return arr
 end
@@ -424,10 +426,11 @@ local function SafeSendChat(msg, chatType)
   if msg == "" then return end
   if not (C_ChatInfo and C_ChatInfo.SendChatMessage) then return end
 
-  -- Prefer securecallfunction when available; do NOT fall back to global SendChatMessage.
+  local ok = false
   if type(securecallfunction) == "function" then
-    pcall(securecallfunction, C_ChatInfo.SendChatMessage, msg, chatType)
-  else
+    ok = pcall(securecallfunction, C_ChatInfo.SendChatMessage, msg, chatType)
+  end
+  if not ok then
     pcall(C_ChatInfo.SendChatMessage, msg, chatType)
   end
 end
@@ -450,7 +453,7 @@ local function BuildChatLines()
   if configured < 5 then configured = 5 end
   local topN = math.min(configured, total)
 
-  -- One player per line (as requested)
+  -- One player per line
   for i = 1, topN do
     local row = arr[i]
     table.insert(lines, string.format("%d) %s - %d %s", i, row.short, row.count, JumpWord(row.count)))
@@ -469,12 +472,11 @@ local function PostToChat(lines)
 end
 
 local function DeterministicDelaySeconds(key)
-  -- 0.35 .. 0.95 seconds based on checksum of a stable string (full name)
   local sum = 0
   for i = 1, #key do
     sum = (sum + string.byte(key, i)) % 1000
   end
-  return 0.35 + ((sum % 600) / 1000)
+  return 0.35 + ((sum % 600) / 1000) -- 0.35 .. 0.95
 end
 
 local function ConsiderClaim(winnerFull, winnerCount)
@@ -499,7 +501,6 @@ local function ConsiderClaim(winnerFull, winnerCount)
 end
 
 local function FinalWinnerFull()
-  -- Prefer claim-based convergence; fall back to local if no claims
   if claimWinnerFull and claimWinnerFull ~= "" and (claimWinnerCount or 0) > 0 then
     return claimWinnerFull, claimWinnerCount
   end
@@ -521,7 +522,10 @@ local function HandleEncounterEndPosting()
     -- Send my local claim to help everyone converge
     local localWinner, localCount = DetermineLocalWinner()
     if not localWinner or localCount <= 0 then return end
+
     SendClaim(localWinner, localCount)
+    -- IMPORTANT: apply our own claim locally too (improves convergence even if claims are delayed/lost)
+    ConsiderClaim(localWinner, localCount)
 
     -- Give time for claims to arrive before selecting final winner
     C_Timer.After(gather, function()
@@ -653,7 +657,11 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     if phase == "idle" then return end
     if enc ~= encounterID then return end
 
-    if count <= 0 and not jumped[sender] then
+    if count <= 0 then
+      -- Not expected in normal operation, but handle gracefully
+      if jumped[sender] then
+        totals[sender] = nil
+      end
       if classFile ~= "" then classByName[sender] = classFile end
       return
     end

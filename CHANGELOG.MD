@@ -3,6 +3,31 @@
 All notable changes to **JumpBoss** are documented in this file.
 
 ---
+## 1.2.7
+### Fixed
+- Fixed unreliable live jump updates:
+  - Added `PLAYER_JUMP` as the primary jump detection event.
+  - Kept a debounced `JumpOrAscendStart` fallback to avoid missed jumps.
+- Fixed rare double-counting of jumps caused by multiple jump events firing.
+- Fixed edge cases where winner arbitration could desync due to lost claim messages:
+  - Local claim is now immediately applied to the arbitration pool.
+
+### Improved
+- Live encounter syncing is more resilient:
+  - Periodic `REQ` pulses during encounters recover missed state updates.
+- Winner-only posting is now fully deterministic across all clients:
+  - Uses full player names for arbitration and tie-breaking.
+  - Posting delays are derived from a stable per-player checksum.
+- Chat output clarity:
+  - One player per line.
+  - `(Kill)` or `(Wipe)` is shown based on encounter outcome.
+- Chat safety and taint protection:
+  - All chat output routes through `C_ChatInfo.SendChatMessage`.
+  - Uses `securecallfunction` when available with safe fallback.
+
+### Notes
+- JumpBoss remains fully peer-to-peer; there is no host or leader.
+- Only players running JumpBoss and who jump at least once are tracked or posted.
 
 ## 1.2.6
 ### Fixed
