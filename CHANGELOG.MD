@@ -3,6 +3,27 @@
 All notable changes to **JumpBoss** are documented in this file.
 
 ---
+
+## 1.2.8
+### Fixed
+- Fixed addon load error on some clients:
+  - Removed registration for the unknown event `PLAYER_JUMP` (`Frame:RegisterEvent(): Attempt to register unknown event "PLAYER_JUMP"`).
+- Fixed protected/taint chat posting failures on encounter end:
+  - End-of-encounter chat output is now **queued if the winner is in combat** and automatically posted on `PLAYER_REGEN_ENABLED`.
+  - Prevents `[ADDON_ACTION_FORBIDDEN] ... tried to call the protected function 'UNKNOWN()'` errors during/after wipes and kills.
+- Fixed cases where posting would silently fail and lead to follow-up multi-post attempts:
+  - Winner still sends the `P:<enc>:<poster>` lock immediately, but chat lines are posted only when it is safe.
+
+### Improved
+- Posting reliability in raids:
+  - Winner-only output is now resilient to combat lockdown timing at `ENCOUNTER_END`, especially on wipes.
+
+### Notes
+- Jump detection remains the debounced `JumpOrAscendStart` hook (combat-safe and compatible).
+- JumpBoss remains fully peer-to-peer; there is no host or leader.
+
+---
+
 ## 1.2.7
 ### Fixed
 - Fixed unreliable live jump updates:

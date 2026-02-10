@@ -1,23 +1,19 @@
 -- JumpBoss.lua
--- v1.2.7
+-- v1.2.8
 --
 -- Fixes / Improvements:
---  - Live updates: uses PLAYER_JUMP (reliable) + debounced hook fallback
---  - Live updates: periodic REQ pulse during encounter to recover missed state
+--  - FIX: Removes invalid event registration "PLAYER_JUMP" (was causing hard errors on load)
+--  - FIX: Chat posting now queues during combat and posts on PLAYER_REGEN_ENABLED (prevents ADDON_ACTION_FORBIDDEN / UNKNOWN())
+--  - Live updates: debounced JumpOrAscendStart hook + periodic REQ pulse during encounter
 --  - Posting: posts on BOTH wipes and kills (ENCOUNTER_END), winner-only
 --  - Posting: claim arbitration is authoritative + POSTED lock cancels others
 --  - Chat: one player per line (plus header)
---  - Safety: avoids taint/protection by using securecallfunction + C_ChatInfo.SendChatMessage
+--  - Safety: uses securecallfunction when available, with guaranteed fallback to pcall(C_ChatInfo.SendChatMessage)
 --  - Safety: hard-sanitizes '|' -> '||' to avoid invalid escape codes
 --
 -- Notes:
 --  - Tracks only JumpBoss users who jumped at least once.
 --  - Comms channel: RAID first, then INSTANCE_CHAT, then PARTY.
---
--- Additional hard fixes in this drop-in:
---  - SafeSendChat now ALWAYS falls back to pcall(C_ChatInfo.SendChatMessage) if securecallfunction is missing/fails
---  - Jump debounce widened to avoid double-counting when PLAYER_JUMP and JumpOrAscendStart both fire
---  - Local claim is applied to the claim pool (ConsiderClaim) to improve convergence even if other claims are delayed/lost
 
 local ADDON_NAME = ...
 local PREFIX = "JBT1"
@@ -118,7 +114,6 @@ local jumped = {}      -- fullName -> true once jumped
 local lastBroadcastAt = 0
 local lastHeartbeatAt = 0
 local pendingBroadcast = false
-
 local lastReqPulseAt = 0
 
 -- Winner arbitration / posting lock (FULL names for determinism)
@@ -126,6 +121,10 @@ local claimWinnerFull = nil
 local claimWinnerCount = 0
 local postedByFull = nil
 local postTimer = nil
+
+-- Chat queue (combat-safe posting)
+local pendingChatLines = nil
+local waitingForRegen = false
 
 local lastJumpAt = 0
 
@@ -362,60 +361,8 @@ local function SendPosted(posterFull)
 end
 
 -- -----------------------------
--- Jump detection
+-- Chat safety
 -- -----------------------------
-local function OnJumpDetected()
-  if phase ~= "active" then return end
-  if UnitInVehicle("player") or UnitOnTaxi("player") then return end
-
-  local t = Now()
-  -- widened debounce to avoid double counting when PLAYER_JUMP and JumpOrAscendStart both fire
-  if (t - lastJumpAt) < 0.20 then return end
-  lastJumpAt = t
-
-  myJumps = myJumps + 1
-  if myJumps == 1 then jumped[myName] = true end
-
-  totals[myName] = myJumps
-  lastSeen[myName] = t
-  classByName[myName] = myClass
-
-  BroadcastUpdate(false)
-  UpdateUI()
-end
-
--- Fallback hook (kept) - debounced by OnJumpDetected
-hooksecurefunc("JumpOrAscendStart", function()
-  OnJumpDetected()
-end)
-
--- -----------------------------
--- Posting helpers
--- -----------------------------
-local function BuildSortedTotalsAll()
-  local arr = {}
-  for name, count in pairs(totals) do
-    if type(count) == "number" and count > 0 then
-      table.insert(arr, { name = name, count = count, short = ShortName(name) })
-    end
-  end
-  table.sort(arr, function(a, b)
-    if a.count ~= b.count then return a.count > b.count end
-    return a.name < b.name -- full-name tie-break for determinism across realms
-  end)
-  return arr
-end
-
-local function DetermineLocalWinner()
-  local arr = BuildSortedTotalsAll()
-  if #arr == 0 then return nil, 0 end
-  return arr[1].name, arr[1].count or 0
-end
-
-local function JumpWord(n)
-  return (n == 1) and "Jump!" or "Jumps!"
-end
-
 local function SanitizeForChat(s)
   if type(s) ~= "string" then return "" end
   return s:gsub("|", "||")
@@ -433,6 +380,87 @@ local function SafeSendChat(msg, chatType)
   if not ok then
     pcall(C_ChatInfo.SendChatMessage, msg, chatType)
   end
+end
+
+local function PostToChat(lines)
+  if not lines then return end
+  local ch = GetGroupChannel()
+  if not ch then return end
+  for _, line in ipairs(lines) do
+    SafeSendChat(line, ch)
+  end
+end
+
+-- Queue chat posting if we are still in combat at encounter end (prevents protected call errors)
+local function QueueChatPost(lines)
+  if not lines or #lines == 0 then return end
+  pendingChatLines = lines
+
+  if InCombatLockdown and InCombatLockdown() then
+    if not waitingForRegen then
+      waitingForRegen = true
+      f:RegisterEvent("PLAYER_REGEN_ENABLED")
+    end
+    return
+  end
+
+  PostToChat(pendingChatLines)
+  pendingChatLines = nil
+end
+
+-- -----------------------------
+-- Jump detection
+-- -----------------------------
+local function OnJumpDetected()
+  if phase ~= "active" then return end
+  if UnitInVehicle("player") or UnitOnTaxi("player") then return end
+
+  local t = Now()
+  -- widened debounce to avoid double counting when multiple jump sources fire
+  if (t - lastJumpAt) < 0.20 then return end
+  lastJumpAt = t
+
+  myJumps = myJumps + 1
+  if myJumps == 1 then jumped[myName] = true end
+
+  totals[myName] = myJumps
+  lastSeen[myName] = t
+  classByName[myName] = myClass
+
+  BroadcastUpdate(false)
+  UpdateUI()
+end
+
+-- Debounced jump hook (reliable across clients)
+hooksecurefunc("JumpOrAscendStart", function()
+  OnJumpDetected()
+end)
+
+-- -----------------------------
+-- Posting helpers
+-- -----------------------------
+local function BuildSortedTotalsAll()
+  local arr = {}
+  for name, count in pairs(totals) do
+    if type(count) == "number" and count > 0 then
+      table.insert(arr, { name = name, count = count, short = ShortName(name) })
+    end
+  end
+  table.sort(arr, function(a, b)
+    if a.count ~= b.count then return a.count > b.count end
+    return a.name < b.name -- determinism across clients/realms
+  end)
+  return arr
+end
+
+local function DetermineLocalWinner()
+  local arr = BuildSortedTotalsAll()
+  if #arr == 0 then return nil, 0 end
+  return arr[1].name, arr[1].count or 0
+end
+
+local function JumpWord(n)
+  return (n == 1) and "Jump!" or "Jumps!"
 end
 
 local function BuildChatLines()
@@ -462,15 +490,6 @@ local function BuildChatLines()
   return lines
 end
 
-local function PostToChat(lines)
-  if not lines then return end
-  local ch = GetGroupChannel()
-  if not ch then return end
-  for _, line in ipairs(lines) do
-    SafeSendChat(line, ch)
-  end
-end
-
 local function DeterministicDelaySeconds(key)
   local sum = 0
   for i = 1, #key do
@@ -484,7 +503,6 @@ local function ConsiderClaim(winnerFull, winnerCount)
   winnerCount = tonumber(winnerCount or 0) or 0
   if winnerFull == "" or winnerCount <= 0 then return end
 
-  -- Keep best by: higher count, then alphabetical full name
   if not claimWinnerFull then
     claimWinnerFull = winnerFull
     claimWinnerCount = winnerCount
@@ -524,7 +542,6 @@ local function HandleEncounterEndPosting()
     if not localWinner or localCount <= 0 then return end
 
     SendClaim(localWinner, localCount)
-    -- IMPORTANT: apply our own claim locally too (improves convergence even if claims are delayed/lost)
     ConsiderClaim(localWinner, localCount)
 
     -- Give time for claims to arrive before selecting final winner
@@ -546,10 +563,10 @@ local function HandleEncounterEndPosting()
         local finalWinner = select(1, FinalWinnerFull())
         if finalWinner ~= myName then return end
 
-        -- Lock first, then post
+        -- Lock first, then queue post (combat-safe)
         postedByFull = myName
         SendPosted(myName)
-        PostToChat(BuildChatLines())
+        QueueChatPost(BuildChatLines())
       end)
     end)
   end)
@@ -580,6 +597,10 @@ local function BeginEncounter(newID, newName)
   claimWinnerCount = 0
   postedByFull = nil
   CancelPostTimer()
+
+  pendingChatLines = nil
+  waitingForRegen = false
+  f:UnregisterEvent("PLAYER_REGEN_ENABLED")
 
   SendHello()
   SendRequest()
@@ -658,7 +679,6 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     if enc ~= encounterID then return end
 
     if count <= 0 then
-      -- Not expected in normal operation, but handle gracefully
       if jumped[sender] then
         totals[sender] = nil
       end
@@ -666,13 +686,11 @@ local function OnAddonMessage(prefix, msg, channel, sender)
       return
     end
 
-    if count > 0 then
-      jumped[sender] = true
-      totals[sender] = count
-      lastSeen[sender] = Now()
-      if classFile ~= "" then classByName[sender] = classFile end
-      UpdateUI()
-    end
+    jumped[sender] = true
+    totals[sender] = count
+    lastSeen[sender] = Now()
+    if classFile ~= "" then classByName[sender] = classFile end
+    UpdateUI()
     return
   end
 
@@ -693,7 +711,6 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     if not enc or not posterFull or posterFull == "" then return end
     if enc ~= encounterID then return end
 
-    -- Hard stop: someone posted; cancel any scheduled post.
     postedByFull = posterFull
     CancelPostTimer()
     return
@@ -766,14 +783,17 @@ f:SetScript("OnEvent", function(self, event, ...)
     C_ChatInfo.RegisterAddonMessagePrefix(PREFIX)
     ApplyUISettings()
     UpdateUI()
-
-    -- Prefer PLAYER_JUMP for reliable jump detection
-    f:RegisterEvent("PLAYER_JUMP")
     return
   end
 
-  if event == "PLAYER_JUMP" then
-    OnJumpDetected()
+  if event == "PLAYER_REGEN_ENABLED" then
+    waitingForRegen = false
+    f:UnregisterEvent("PLAYER_REGEN_ENABLED")
+
+    if pendingChatLines then
+      PostToChat(pendingChatLines)
+      pendingChatLines = nil
+    end
     return
   end
 
