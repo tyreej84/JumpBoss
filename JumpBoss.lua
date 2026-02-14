@@ -1,14 +1,19 @@
 -- JumpBoss.lua
--- v1.2.8
+-- v1.2.9
 --
 -- Fixes / Improvements:
---  - FIX: Removes invalid event registration "PLAYER_JUMP" (was causing hard errors on load)
---  - FIX: Chat posting now queues during combat and posts on PLAYER_REGEN_ENABLED (prevents ADDON_ACTION_FORBIDDEN / UNKNOWN())
+--  - FIX: Multi-poster issues hardened:
+--      * Burst end-of-encounter sync (extra STATE/REQ for 2s) to improve convergence
+--      * Winner sends POSTED lock (P:) multiple times for reliability
+--      * Claims (C:) are re-broadcast to reduce loss-based divergence
+--  - FIX: ADDON_ACTION_FORBIDDEN / UNKNOWN():
+--      * Never posts chat in ENCOUNTER_END call stack (always deferred)
+--      * Chat posting is queued + retries (combat-safe + taint-safe-ish)
 --  - Live updates: debounced JumpOrAscendStart hook + periodic REQ pulse during encounter
 --  - Posting: posts on BOTH wipes and kills (ENCOUNTER_END), winner-only
---  - Posting: claim arbitration is authoritative + POSTED lock cancels others
+--  - Posting: claim arbitration uses FULL names for deterministic tie-break
 --  - Chat: one player per line (plus header)
---  - Safety: uses securecallfunction when available, with guaranteed fallback to pcall(C_ChatInfo.SendChatMessage)
+--  - Safety: uses securecallfunction when available, falls back quietly (no hard errors)
 --  - Safety: hard-sanitizes '|' -> '||' to avoid invalid escape codes
 --
 -- Notes:
@@ -39,11 +44,14 @@ local DEFAULTS = {
   staleTimeout = 120.0,
   fadeDuration = 10.0,
 
-  syncWindow = 5.0,
-  claimPostDelay = 1.00,
+  syncWindow = 5.0,           -- time to let STATE/claims settle before selecting winner
+  claimPostDelay = 0.75,      -- additional settle time after sending claim
   postVisibleSeconds = 20.0,
 
-  reqPulseInterval = 3.0, -- periodic REQ during encounter to improve live updates
+  reqPulseInterval = 3.0,     -- periodic REQ during encounter
+  endBurstSeconds = 2.0,      -- NEW: burst sync after ENCOUNTER_END
+  endBurstStateEvery = 0.40,  -- NEW: STATE interval during burst
+  endBurstReqEvery = 0.70,    -- NEW: REQ interval during burst
 
   postTopN = 5, -- min 5 enforced
 
@@ -84,7 +92,7 @@ local function Clamp(x, a, b)
 end
 
 -- IMPORTANT:
--- Prefer RAID first so everyone in a raid uses the same channel.
+-- Prefer RAID first so everyone in a raid uses the same addon channel.
 -- Then INSTANCE_CHAT for LFG/instance parties, then PARTY.
 local function GetGroupChannel()
   if IsInRaid() then return "RAID" end
@@ -116,21 +124,32 @@ local lastHeartbeatAt = 0
 local pendingBroadcast = false
 local lastReqPulseAt = 0
 
+-- End burst sync
+local endBurstUntil = 0
+local lastEndBurstStateAt = 0
+local lastEndBurstReqAt = 0
+
 -- Winner arbitration / posting lock (FULL names for determinism)
 local claimWinnerFull = nil
 local claimWinnerCount = 0
 local postedByFull = nil
 local postTimer = nil
 
--- Chat queue (combat-safe posting)
+-- Chat queue (combat/taint-safe posting)
 local pendingChatLines = nil
 local waitingForRegen = false
+local chatRetryTimer = nil
 
 local lastJumpAt = 0
 
 local function CancelPostTimer()
   if postTimer and postTimer.Cancel then postTimer:Cancel() end
   postTimer = nil
+end
+
+local function CancelChatRetry()
+  if chatRetryTimer and chatRetryTimer.Cancel then chatRetryTimer:Cancel() end
+  chatRetryTimer = nil
 end
 
 -- Throttle for hello/request spam
@@ -351,6 +370,27 @@ local function ReqPulse()
   SendRequest()
 end
 
+-- End burst sync: extra STATE/REQ after encounter end to help everyone converge
+local function EndBurstTick()
+  if phase ~= "ended" then return end
+  local t = Now()
+  if t > endBurstUntil then return end
+
+  local stateEvery = db.endBurstStateEvery or DEFAULTS.endBurstStateEvery
+  local reqEvery = db.endBurstReqEvery or DEFAULTS.endBurstReqEvery
+
+  if myJumps > 0 and (t - lastEndBurstStateAt) >= stateEvery then
+    lastEndBurstStateAt = t
+    SendState()
+  end
+
+  if (t - lastEndBurstReqAt) >= reqEvery then
+    lastEndBurstReqAt = t
+    -- pull any missed states
+    SendRequest()
+  end
+end
+
 -- Claims / Posted lock
 local function SendClaim(winnerFull, winnerCount)
   SendComm(string.format("C:%d:%s:%d", encounterID, winnerFull or "", tonumber(winnerCount or 0) or 0))
@@ -358,6 +398,18 @@ end
 
 local function SendPosted(posterFull)
   SendComm(string.format("P:%d:%s", encounterID, posterFull or ""))
+end
+
+local function SendPostedBurst(posterFull)
+  -- send 3 times (spaced) to reduce "missed P" multi-posts
+  SendPosted(posterFull)
+  C_Timer.After(0.20, function() SendPosted(posterFull) end)
+  C_Timer.After(0.45, function() SendPosted(posterFull) end)
+end
+
+local function SendClaimBurst(winnerFull, winnerCount)
+  SendClaim(winnerFull, winnerCount)
+  C_Timer.After(0.25, function() SendClaim(winnerFull, winnerCount) end)
 end
 
 -- -----------------------------
@@ -368,30 +420,61 @@ local function SanitizeForChat(s)
   return s:gsub("|", "||")
 end
 
-local function SafeSendChat(msg, chatType)
+local function TrySendChatLine(msg, chatType)
   msg = SanitizeForChat(msg)
-  if msg == "" then return end
-  if not (C_ChatInfo and C_ChatInfo.SendChatMessage) then return end
+  if msg == "" then return true end
+  if not (C_ChatInfo and C_ChatInfo.SendChatMessage) then return false end
 
-  local ok = false
+  -- If we're in combat, do not attempt at all (avoid forbidden spam)
+  if InCombatLockdown and InCombatLockdown() then
+    return false
+  end
+
+  -- Try securecallfunction first; if it errors/forbids, treat as failure and retry later.
   if type(securecallfunction) == "function" then
-    ok = pcall(securecallfunction, C_ChatInfo.SendChatMessage, msg, chatType)
+    local ok = pcall(securecallfunction, C_ChatInfo.SendChatMessage, msg, chatType)
+    if ok then return true end
   end
-  if not ok then
-    pcall(C_ChatInfo.SendChatMessage, msg, chatType)
-  end
+
+  -- Fallback: try a plain call, but protect it. If it fails, we retry later.
+  local ok2 = pcall(C_ChatInfo.SendChatMessage, msg, chatType)
+  return ok2
 end
 
-local function PostToChat(lines)
-  if not lines then return end
+local function TryFlushChatQueue()
+  if not pendingChatLines or #pendingChatLines == 0 then
+    pendingChatLines = nil
+    return true
+  end
+
   local ch = GetGroupChannel()
-  if not ch then return end
-  for _, line in ipairs(lines) do
-    SafeSendChat(line, ch)
+  if not ch then return false end
+
+  for i = 1, #pendingChatLines do
+    local ok = TrySendChatLine(pendingChatLines[i], ch)
+    if not ok then
+      return false
+    end
   end
+
+  pendingChatLines = nil
+  return true
 end
 
--- Queue chat posting if we are still in combat at encounter end (prevents protected call errors)
+local function ScheduleChatRetry()
+  CancelChatRetry()
+  chatRetryTimer = C_Timer.NewTimer(0.80, function()
+    chatRetryTimer = nil
+    if pendingChatLines then
+      local ok = TryFlushChatQueue()
+      if not ok then
+        -- keep retrying until safe
+        ScheduleChatRetry()
+      end
+    end
+  end)
+end
+
 local function QueueChatPost(lines)
   if not lines or #lines == 0 then return end
   pendingChatLines = lines
@@ -401,11 +484,23 @@ local function QueueChatPost(lines)
       waitingForRegen = true
       f:RegisterEvent("PLAYER_REGEN_ENABLED")
     end
+    ScheduleChatRetry()
     return
   end
 
-  PostToChat(pendingChatLines)
-  pendingChatLines = nil
+  -- IMPORTANT: never send immediately from ENCOUNTER_END stack; always defer a tick.
+  C_Timer.After(0.10, function()
+    if not pendingChatLines then return end
+    local ok = TryFlushChatQueue()
+    if not ok then
+      -- Will retry (and also on regen if needed)
+      ScheduleChatRetry()
+      if InCombatLockdown and InCombatLockdown() and not waitingForRegen then
+        waitingForRegen = true
+        f:RegisterEvent("PLAYER_REGEN_ENABLED")
+      end
+    end
+  end)
 end
 
 -- -----------------------------
@@ -416,7 +511,6 @@ local function OnJumpDetected()
   if UnitInVehicle("player") or UnitOnTaxi("player") then return end
 
   local t = Now()
-  -- widened debounce to avoid double counting when multiple jump sources fire
   if (t - lastJumpAt) < 0.20 then return end
   lastJumpAt = t
 
@@ -431,7 +525,6 @@ local function OnJumpDetected()
   UpdateUI()
 end
 
--- Debounced jump hook (reliable across clients)
 hooksecurefunc("JumpOrAscendStart", function()
   OnJumpDetected()
 end)
@@ -448,7 +541,7 @@ local function BuildSortedTotalsAll()
   end
   table.sort(arr, function(a, b)
     if a.count ~= b.count then return a.count > b.count end
-    return a.name < b.name -- determinism across clients/realms
+    return a.name < b.name
   end)
   return arr
 end
@@ -481,7 +574,6 @@ local function BuildChatLines()
   if configured < 5 then configured = 5 end
   local topN = math.min(configured, total)
 
-  -- One player per line
   for i = 1, topN do
     local row = arr[i]
     table.insert(lines, string.format("%d) %s - %d %s", i, row.short, row.count, JumpWord(row.count)))
@@ -495,7 +587,7 @@ local function DeterministicDelaySeconds(key)
   for i = 1, #key do
     sum = (sum + string.byte(key, i)) % 1000
   end
-  return 0.35 + ((sum % 600) / 1000) -- 0.35 .. 0.95
+  return 0.45 + ((sum % 650) / 1000) -- 0.45 .. 1.10 (slightly wider)
 end
 
 local function ConsiderClaim(winnerFull, winnerCount)
@@ -534,24 +626,22 @@ local function HandleEncounterEndPosting()
   claimWinnerFull = nil
   claimWinnerCount = 0
 
+  -- Step 1: after window, broadcast our claim (burst) and apply it locally
   C_Timer.After(window, function()
     if postedByFull then return end
 
-    -- Send my local claim to help everyone converge
     local localWinner, localCount = DetermineLocalWinner()
     if not localWinner or localCount <= 0 then return end
 
-    SendClaim(localWinner, localCount)
+    SendClaimBurst(localWinner, localCount)
     ConsiderClaim(localWinner, localCount)
 
-    -- Give time for claims to arrive before selecting final winner
+    -- Step 2: give claims time to arrive, then decide final
     C_Timer.After(gather, function()
       if postedByFull then return end
 
       local winnerFull = select(1, FinalWinnerFull())
       if not winnerFull or winnerFull == "" then return end
-
-      -- Only the final winner attempts to post
       if winnerFull ~= myName then return end
 
       local delay = DeterministicDelaySeconds(myName)
@@ -559,13 +649,12 @@ local function HandleEncounterEndPosting()
         postTimer = nil
         if postedByFull then return end
 
-        -- Re-check final winner right before posting
         local finalWinner = select(1, FinalWinnerFull())
         if finalWinner ~= myName then return end
 
-        -- Lock first, then queue post (combat-safe)
+        -- Lock first (burst), then queue chat (deferred + retry)
         postedByFull = myName
-        SendPosted(myName)
+        SendPostedBurst(myName)
         QueueChatPost(BuildChatLines())
       end)
     end)
@@ -593,6 +682,10 @@ local function BeginEncounter(newID, newName)
   pendingBroadcast = false
   lastReqPulseAt = 0
 
+  endBurstUntil = 0
+  lastEndBurstStateAt = 0
+  lastEndBurstReqAt = 0
+
   claimWinnerFull = nil
   claimWinnerCount = 0
   postedByFull = nil
@@ -600,6 +693,7 @@ local function BeginEncounter(newID, newName)
 
   pendingChatLines = nil
   waitingForRegen = false
+  CancelChatRetry()
   f:UnregisterEvent("PLAYER_REGEN_ENABLED")
 
   SendHello()
@@ -618,7 +712,13 @@ local function FreezeEncounter(encIDFromEvent, successFlag)
 
   encounterSuccess = (successFlag == 1) and true or ((successFlag == 0) and false or encounterSuccess)
 
-  -- Final push + pull
+  -- Start end burst window (extra sync for convergence)
+  local burst = db.endBurstSeconds or DEFAULTS.endBurstSeconds
+  endBurstUntil = Now() + burst
+  lastEndBurstStateAt = 0
+  lastEndBurstReqAt = 0
+
+  -- Initial push + pull
   SendState()
   SendRequest()
   UpdateUI()
@@ -679,9 +779,7 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     if enc ~= encounterID then return end
 
     if count <= 0 then
-      if jumped[sender] then
-        totals[sender] = nil
-      end
+      if jumped[sender] then totals[sender] = nil end
       if classFile ~= "" then classByName[sender] = classFile end
       return
     end
@@ -711,6 +809,7 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     if not enc or not posterFull or posterFull == "" then return end
     if enc ~= encounterID then return end
 
+    -- Hard stop: someone posted; cancel any scheduled post.
     postedByFull = posterFull
     CancelPostTimer()
     return
@@ -791,8 +890,11 @@ f:SetScript("OnEvent", function(self, event, ...)
     f:UnregisterEvent("PLAYER_REGEN_ENABLED")
 
     if pendingChatLines then
-      PostToChat(pendingChatLines)
-      pendingChatLines = nil
+      -- try now that we are out of combat
+      local ok = TryFlushChatQueue()
+      if not ok then
+        ScheduleChatRetry()
+      end
     end
     return
   end
@@ -844,6 +946,8 @@ ui:SetScript("OnUpdate", function(self, elapsed)
     end
     Heartbeat()
     ReqPulse()
+  elseif phase == "ended" then
+    EndBurstTick()
   end
 
   UpdateUI()
