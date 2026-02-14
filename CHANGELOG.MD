@@ -4,6 +4,31 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.2.9
+### Fixed
+- Fixed remaining cases where **multiple players could still post** the leaderboard:
+  - Added a short **end-of-encounter burst sync** window (extra `STATE` + `REQ` traffic for ~2 seconds) to reduce missed updates and improve convergence.
+  - Winner now sends the posted-lock **multiple times** (`P:<enc>:<poster>` burst) to prevent “missed lock” scenarios that lead to multi-posting.
+  - Winner claim messages are also **re-broadcast** to reduce desync caused by lost `C:` messages.
+
+- Fixed protected/taint errors still occurring at encounter end (`[ADDON_ACTION_FORBIDDEN] ... 'UNKNOWN()'`):
+  - Chat output is **never sent in the ENCOUNTER_END call stack** (always deferred).
+  - Chat posting now uses a **retrying queue**:
+    - Defers briefly, attempts to send when safe
+    - Retries automatically (timer-based)
+    - Also flushes on `PLAYER_REGEN_ENABLED` if combat lockdown is active
+
+### Improved
+- End-of-encounter posting reliability:
+  - Slightly wider deterministic delays to reduce same-frame collisions.
+  - More resilient posting flow when the winner is in combat or the UI is in a protected state.
+
+### Notes
+- JumpBoss remains fully peer-to-peer; there is no host or leader.
+- Only players running JumpBoss and who jump at least once are tracked or posted.
+
+---
+
 ## 1.2.8
 ### Fixed
 - Fixed addon load error on some clients:
