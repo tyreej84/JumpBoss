@@ -4,6 +4,25 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.2.10
+### Fixed
+- Fixed remaining protected-call/taint failures while posting results:
+  - Removed the `securecallfunction` chat-send path that still triggered `[ADDON_ACTION_FORBIDDEN] ... 'UNKNOWN()'` on some clients.
+  - Chat sends now stay fully queued/guarded and defer until safe combat state.
+
+- Fixed live in-fight totals not appearing reliably for some users:
+  - Added optional `PLAYER_JUMP` event handling (when supported by the client).
+  - Kept `JumpOrAscendStart` hook fallback for compatibility.
+  - Added addon comm API fallbacks for prefix registration and addon message sending across client variants.
+
+### Improved
+- Mid-encounter leaderboard consistency:
+  - Better cross-client compatibility for HELLO/REQ/STATE traffic so remote jump counts populate during the fight.
+
+### Notes
+- JumpBoss remains fully peer-to-peer; there is no host or leader.
+- Only players running JumpBoss and who jump at least once are tracked or posted.
+
 ## 1.2.9
 ### Fixed
 - Fixed remaining cases where **multiple players could still post** the leaderboard:

@@ -1,5 +1,5 @@
 -- JumpBoss.lua
--- v1.2.9
+-- v1.2.10
 --
 -- Fixes / Improvements:
 --  - FIX: Multi-poster issues hardened:
@@ -13,7 +13,7 @@
 --  - Posting: posts on BOTH wipes and kills (ENCOUNTER_END), winner-only
 --  - Posting: claim arbitration uses FULL names for deterministic tie-break
 --  - Chat: one player per line (plus header)
---  - Safety: uses securecallfunction when available, falls back quietly (no hard errors)
+--  - Safety: avoids securecallfunction send path; queued retries use guarded C_ChatInfo.SendChatMessage
 --  - Safety: hard-sanitizes '|' -> '||' to avoid invalid escape codes
 --
 -- Notes:
@@ -311,10 +311,32 @@ end
 -- -----------------------------
 -- Addon comms
 -- -----------------------------
+local function RegisterPrefix(prefix)
+  if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
+    return C_ChatInfo.RegisterAddonMessagePrefix(prefix)
+  end
+  if RegisterAddonMessagePrefix then
+    return RegisterAddonMessagePrefix(prefix)
+  end
+  return false
+end
+
+local function SendAddon(prefix, msg, ch)
+  if C_ChatInfo and C_ChatInfo.SendAddonMessage then
+    C_ChatInfo.SendAddonMessage(prefix, msg, ch)
+    return true
+  end
+  if SendAddonMessage then
+    SendAddonMessage(prefix, msg, ch)
+    return true
+  end
+  return false
+end
+
 local function SendComm(msg)
   local ch = GetGroupChannel()
-  if not ch or not C_ChatInfo then return end
-  C_ChatInfo.SendAddonMessage(PREFIX, msg, ch)
+  if not ch then return end
+  SendAddon(PREFIX, msg, ch)
 end
 
 local function SendHello()
@@ -425,20 +447,16 @@ local function TrySendChatLine(msg, chatType)
   if msg == "" then return true end
   if not (C_ChatInfo and C_ChatInfo.SendChatMessage) then return false end
 
-  -- If we're in combat, do not attempt at all (avoid forbidden spam)
-  if InCombatLockdown and InCombatLockdown() then
+  -- Be conservative: avoid any send attempt while player is in/near combat state.
+  if (InCombatLockdown and InCombatLockdown()) or (UnitAffectingCombat and UnitAffectingCombat("player")) then
     return false
   end
 
-  -- Try securecallfunction first; if it errors/forbids, treat as failure and retry later.
-  if type(securecallfunction) == "function" then
-    local ok = pcall(securecallfunction, C_ChatInfo.SendChatMessage, msg, chatType)
-    if ok then return true end
-  end
-
-  -- Fallback: try a plain call, but protect it. If it fails, we retry later.
-  local ok2 = pcall(C_ChatInfo.SendChatMessage, msg, chatType)
-  return ok2
+  -- Avoid securecallfunction here; this path has produced protected-call errors on some clients.
+  local ok = pcall(function()
+    C_ChatInfo.SendChatMessage(msg, chatType)
+  end)
+  return ok
 end
 
 local function TryFlushChatQueue()
@@ -879,7 +897,7 @@ f:SetScript("OnEvent", function(self, event, ...)
       db.postTopN = 5
     end
 
-    C_ChatInfo.RegisterAddonMessagePrefix(PREFIX)
+    RegisterPrefix(PREFIX)
     ApplyUISettings()
     UpdateUI()
     return
@@ -911,6 +929,11 @@ f:SetScript("OnEvent", function(self, event, ...)
     return
   end
 
+  if event == "PLAYER_JUMP" then
+    OnJumpDetected()
+    return
+  end
+
   if event == "ENCOUNTER_END" then
     local encID, encName, difficultyID, groupSize, success = ...
     if phase ~= "idle" then
@@ -934,6 +957,10 @@ f:RegisterEvent("ADDON_LOADED")
 f:RegisterEvent("CHAT_MSG_ADDON")
 f:RegisterEvent("ENCOUNTER_START")
 f:RegisterEvent("ENCOUNTER_END")
+-- Register PLAYER_JUMP when the client supports it; fallback hook above remains active.
+pcall(function()
+  f:RegisterEvent("PLAYER_JUMP")
+end)
 f:RegisterEvent("GROUP_ROSTER_UPDATE")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
 
