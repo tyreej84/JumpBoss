@@ -4,7 +4,7 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
-## 1.2.11
+## 1.3.0
 ### Fixed
 - Fixed remaining `ADDON_ACTION_FORBIDDEN` cases when posting results:
   - Chat queue retries now use a stricter safety gate before any send attempt.
