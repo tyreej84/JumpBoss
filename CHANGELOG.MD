@@ -4,6 +4,16 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.2.11
+### Fixed
+- Fixed remaining `ADDON_ACTION_FORBIDDEN` cases when posting results:
+  - Chat queue retries now use a stricter safety gate before any send attempt.
+  - Added a short post-`PLAYER_REGEN_ENABLED` settle delay to avoid same-frame combat-exit race conditions.
+  - Prevented retry timer attempts from calling chat send while not definitively safe.
+
+### Notes
+- Posting flow remains winner-only and deferred; this change hardens safety checks around the existing queue.
+
 ## 1.2.10
 ### Fixed
 - Fixed remaining protected-call/taint failures while posting results:

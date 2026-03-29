@@ -1,5 +1,5 @@
 -- JumpBoss.lua
--- v1.2.10
+-- v1.2.11
 --
 -- Fixes / Improvements:
 --  - FIX: Multi-poster issues hardened:
@@ -139,6 +139,7 @@ local postTimer = nil
 local pendingChatLines = nil
 local waitingForRegen = false
 local chatRetryTimer = nil
+local lastRegenAt = 0
 
 local lastJumpAt = 0
 
@@ -442,15 +443,25 @@ local function SanitizeForChat(s)
   return s:gsub("|", "||")
 end
 
-local function TrySendChatLine(msg, chatType)
-  msg = SanitizeForChat(msg)
-  if msg == "" then return true end
+local function IsChatSendSafe()
   if not (C_ChatInfo and C_ChatInfo.SendChatMessage) then return false end
 
-  -- Be conservative: avoid any send attempt while player is in/near combat state.
   if (InCombatLockdown and InCombatLockdown()) or (UnitAffectingCombat and UnitAffectingCombat("player")) then
     return false
   end
+
+  -- Avoid a same-frame/tiny-window race right after combat ends.
+  if lastRegenAt > 0 and (Now() - lastRegenAt) < 0.30 then
+    return false
+  end
+
+  return true
+end
+
+local function TrySendChatLine(msg, chatType)
+  msg = SanitizeForChat(msg)
+  if msg == "" then return true end
+  if not IsChatSendSafe() then return false end
 
   -- Avoid securecallfunction here; this path has produced protected-call errors on some clients.
   local ok = pcall(function()
@@ -464,6 +475,8 @@ local function TryFlushChatQueue()
     pendingChatLines = nil
     return true
   end
+
+  if not IsChatSendSafe() then return false end
 
   local ch = GetGroupChannel()
   if not ch then return false end
@@ -484,6 +497,11 @@ local function ScheduleChatRetry()
   chatRetryTimer = C_Timer.NewTimer(0.80, function()
     chatRetryTimer = nil
     if pendingChatLines then
+      if not IsChatSendSafe() then
+        ScheduleChatRetry()
+        return
+      end
+
       local ok = TryFlushChatQueue()
       if not ok then
         -- keep retrying until safe
@@ -497,7 +515,7 @@ local function QueueChatPost(lines)
   if not lines or #lines == 0 then return end
   pendingChatLines = lines
 
-  if InCombatLockdown and InCombatLockdown() then
+  if not IsChatSendSafe() then
     if not waitingForRegen then
       waitingForRegen = true
       f:RegisterEvent("PLAYER_REGEN_ENABLED")
@@ -711,6 +729,7 @@ local function BeginEncounter(newID, newName)
 
   pendingChatLines = nil
   waitingForRegen = false
+  lastRegenAt = 0
   CancelChatRetry()
   f:UnregisterEvent("PLAYER_REGEN_ENABLED")
 
@@ -904,15 +923,19 @@ f:SetScript("OnEvent", function(self, event, ...)
   end
 
   if event == "PLAYER_REGEN_ENABLED" then
+    lastRegenAt = Now()
     waitingForRegen = false
     f:UnregisterEvent("PLAYER_REGEN_ENABLED")
 
     if pendingChatLines then
-      -- try now that we are out of combat
-      local ok = TryFlushChatQueue()
-      if not ok then
-        ScheduleChatRetry()
-      end
+      -- Give the client a brief settle window after leaving combat.
+      C_Timer.After(0.30, function()
+        if not pendingChatLines then return end
+        local ok = TryFlushChatQueue()
+        if not ok then
+          ScheduleChatRetry()
+        end
+      end)
     end
     return
   end
