@@ -1,5 +1,5 @@
 -- JumpBoss.lua
--- v1.3.0
+-- v1.3.1
 --
 -- Fixes / Improvements:
 --  - FIX: Multi-poster issues hardened:
@@ -445,6 +445,15 @@ end
 
 local function IsChatSendSafe()
   if not (C_ChatInfo and C_ChatInfo.SendChatMessage) then return false end
+
+  -- If chat send paths are tainted by another addon, do not attempt a protected send.
+  if type(issecurevariable) == "function" then
+    local secureGlobal = issecurevariable("SendChatMessage")
+    local secureCAPI = issecurevariable(C_ChatInfo, "SendChatMessage")
+    if secureGlobal == false or secureCAPI == false then
+      return false
+    end
+  end
 
   if (InCombatLockdown and InCombatLockdown()) or (UnitAffectingCombat and UnitAffectingCombat("player")) then
     return false

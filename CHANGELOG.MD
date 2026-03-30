@@ -4,10 +4,11 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
-## 1.3.0
+## 1.3.1
 ### Fixed
 - Fixed remaining `ADDON_ACTION_FORBIDDEN` cases when posting results:
   - Chat queue retries now use a stricter safety gate before any send attempt.
+  - Chat send attempts are now blocked when `SendChatMessage`/`C_ChatInfo.SendChatMessage` are tainted (`issecurevariable` guard).
   - Added a short post-`PLAYER_REGEN_ENABLED` settle delay to avoid same-frame combat-exit race conditions.
   - Prevented retry timer attempts from calling chat send while not definitively safe.
 
