@@ -1,5 +1,5 @@
 -- JumpBoss.lua
--- v1.3.1
+-- v1.3.2
 --
 -- Fixes / Improvements:
 --  - FIX: Multi-poster issues hardened:
@@ -13,7 +13,8 @@
 --  - Posting: posts on BOTH wipes and kills (ENCOUNTER_END), winner-only
 --  - Posting: claim arbitration uses FULL names for deterministic tie-break
 --  - Chat: one player per line (plus header)
---  - Safety: avoids securecallfunction send path; queued retries use guarded C_ChatInfo.SendChatMessage
+--  - Safety: prefers securecallfunction(SendChatMessage, ...) with guarded C_ChatInfo.SendChatMessage fallback
+--  - Comms: validates SendAddonMessage result codes and fails over across INSTANCE_CHAT/RAID/PARTY
 --  - Safety: hard-sanitizes '|' -> '||' to avoid invalid escape codes
 --
 -- Notes:
@@ -38,8 +39,8 @@ local DEFAULTS = {
   width = 160,
   lineHeight = 13,
 
-  broadcastInterval = 0.10,
-  heartbeatInterval = 1.25,
+  broadcastInterval = 0.20,
+  heartbeatInterval = 2.00,
 
   staleTimeout = 120.0,
   fadeDuration = 10.0,
@@ -48,7 +49,7 @@ local DEFAULTS = {
   claimPostDelay = 0.75,      -- additional settle time after sending claim
   postVisibleSeconds = 20.0,
 
-  reqPulseInterval = 3.0,     -- periodic REQ during encounter
+  reqPulseInterval = 4.0,     -- periodic REQ during encounter
   endBurstSeconds = 2.0,      -- NEW: burst sync after ENCOUNTER_END
   endBurstStateEvery = 0.40,  -- NEW: STATE interval during burst
   endBurstReqEvery = 0.70,    -- NEW: REQ interval during burst
@@ -99,6 +100,20 @@ local function GetGroupChannel()
   if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then return "INSTANCE_CHAT" end
   if IsInGroup() then return "PARTY" end
   return nil
+end
+
+local function BuildGroupChannels()
+  local out = {}
+  if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then
+    table.insert(out, "INSTANCE_CHAT")
+  end
+  if IsInRaid() then
+    table.insert(out, "RAID")
+  end
+  if IsInGroup() then
+    table.insert(out, "PARTY")
+  end
+  return out
 end
 
 -- -----------------------------
@@ -324,20 +339,40 @@ end
 
 local function SendAddon(prefix, msg, ch)
   if C_ChatInfo and C_ChatInfo.SendAddonMessage then
-    C_ChatInfo.SendAddonMessage(prefix, msg, ch)
-    return true
+    local result = C_ChatInfo.SendAddonMessage(prefix, msg, ch)
+    if result == nil or result == 0 then
+      return true, result
+    end
+    return false, result
   end
   if SendAddonMessage then
-    SendAddonMessage(prefix, msg, ch)
-    return true
+    local ok = SendAddonMessage(prefix, msg, ch)
+    if ok == nil or ok == true then
+      return true, ok
+    end
+    return false, ok
   end
-  return false
+  return false, "NoSendAPI"
 end
 
 local function SendComm(msg)
+  local channels = BuildGroupChannels()
+  if #channels == 0 then return false end
+
+  for i = 1, #channels do
+    local ok = SendAddon(PREFIX, msg, channels[i])
+    if ok then
+      return true
+    end
+  end
+
   local ch = GetGroupChannel()
-  if not ch then return end
-  SendAddon(PREFIX, msg, ch)
+  if ch then
+    local ok = SendAddon(PREFIX, msg, ch)
+    if ok then return true end
+  end
+
+  return false
 end
 
 local function SendHello()
@@ -444,7 +479,9 @@ local function SanitizeForChat(s)
 end
 
 local function IsChatSendSafe()
-  if not (C_ChatInfo and C_ChatInfo.SendChatMessage) then return false end
+  local hasGlobalSend = (type(SendChatMessage) == "function")
+  local hasCAPI = (C_ChatInfo and type(C_ChatInfo.SendChatMessage) == "function")
+  if not hasGlobalSend and not hasCAPI then return false end
 
   -- If chat send paths are tainted by another addon, do not attempt a protected send.
   if type(issecurevariable) == "function" then
@@ -472,11 +509,23 @@ local function TrySendChatLine(msg, chatType)
   if msg == "" then return true end
   if not IsChatSendSafe() then return false end
 
-  -- Avoid securecallfunction here; this path has produced protected-call errors on some clients.
-  local ok = pcall(function()
-    C_ChatInfo.SendChatMessage(msg, chatType)
-  end)
-  return ok
+  -- Prefer securecallfunction to avoid protected-call taint during end-of-encounter transitions.
+  if type(securecallfunction) == "function" and type(SendChatMessage) == "function" then
+    local ok = pcall(function()
+      securecallfunction(SendChatMessage, msg, chatType)
+    end)
+    return ok
+  end
+
+  -- Fallback for clients where securecallfunction is unavailable.
+  if C_ChatInfo and type(C_ChatInfo.SendChatMessage) == "function" then
+    local ok = pcall(function()
+      C_ChatInfo.SendChatMessage(msg, chatType)
+    end)
+    return ok
+  end
+
+  return false
 end
 
 local function TryFlushChatQueue()

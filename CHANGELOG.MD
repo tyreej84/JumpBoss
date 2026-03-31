@@ -4,6 +4,20 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.3.2
+### Fixed
+- Fixed live mid-fight leaderboard sync where users could only see their own jumps:
+  - Addon comm sends now validate `C_ChatInfo.SendAddonMessage` result codes instead of assuming success.
+  - Added comm channel failover across `INSTANCE_CHAT` / `RAID` / `PARTY` when a channel send is rejected.
+  - Reduced default comm pressure (`broadcastInterval`, `heartbeatInterval`, `reqPulseInterval`) to lower per-prefix throttle drops.
+
+- Fixed remaining protected chat-posting failures on some clients:
+  - End-of-encounter posting now prefers `securecallfunction(SendChatMessage, ...)` with guarded API fallback.
+  - Chat send safety gate now accepts either global `SendChatMessage` or `C_ChatInfo.SendChatMessage` availability.
+
+### Notes
+- Encounter-time addon communication remains peer-to-peer and combat-safe; Blizzard limits are primarily channel validity and per-prefix throttling.
+
 ## 1.3.1
 ### Fixed
 - Fixed remaining `ADDON_ACTION_FORBIDDEN` cases when posting results:
