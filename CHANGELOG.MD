@@ -4,7 +4,7 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
-## 1.3.2
+.## 1.3.2
 ### Fixed
 - Fixed live mid-fight leaderboard sync where users could only see their own jumps:
   - Addon comm sends now validate `C_ChatInfo.SendAddonMessage` result codes instead of assuming success.
@@ -16,7 +16,7 @@ All notable changes to **JumpBoss** are documented in this file.
   - Chat send safety gate now accepts either global `SendChatMessage` or `C_ChatInfo.SendChatMessage` availability.
 
 ### Notes
-- Encounter-time addon communication remains peer-to-peer and combat-safe; Blizzard limits are primarily channel validity and per-prefix throttling.
+- Encounter-time addon communication remains peer-to-peer and combat-safe; Blizzard limits are primarily channel validity and per-prefix throttling
 
 ## 1.3.1
 ### Fixed
