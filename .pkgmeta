@@ -9,6 +9,7 @@ ignore:
   - .vscode
   - .idea
   - .DS_Store
+  - tools
 
 # Use our own changelog instead of auto-generated one
-manual-changelog: CHANGELOG.md
+manual-changelog: CHANGELOG.MD

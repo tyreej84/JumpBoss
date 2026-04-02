@@ -1,1 +1,24 @@
 Release/
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Editor files
+.vscode/
+.idea/
+*.code-workspace
+
+# Temporary and log files
+*.tmp
+*.temp
+*.bak
+*.orig
+*.log
+
+# Lua generated artifacts
+*.luac
+
+# Archive outputs
+*.zip

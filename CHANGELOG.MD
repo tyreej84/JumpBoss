@@ -4,7 +4,22 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
-.## 1.3.2
+## 1.3.3
+### Fixed
+- Fixed live addon comm delivery to avoid over-sending and silent mid-fight drops:
+  - Comm sends now use a single priority channel path instead of duplicating the same payload across multiple group channels.
+  - Added throttle-aware retry and backoff handling for addon comm traffic.
+  - Updated chat posting to prefer the current `C_ChatInfo.SendChatMessage` API before older fallback paths.
+
+### Improved
+- Local testing and packaging workflow:
+  - Added a local simulation harness for encounter sync and post-combat posting validation.
+  - Excluded local test tooling from packaged addon releases.
+
+### Notes
+- Local testing utilities are kept out of packaged releases and can remain local-only in Git.
+
+## 1.3.2
 ### Fixed
 - Fixed live mid-fight leaderboard sync where users could only see their own jumps:
   - Addon comm sends now validate `C_ChatInfo.SendAddonMessage` result codes instead of assuming success.

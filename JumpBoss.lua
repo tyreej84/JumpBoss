@@ -1,5 +1,5 @@
 -- JumpBoss.lua
--- v1.3.2
+-- v1.3.3
 --
 -- Fixes / Improvements:
 --  - FIX: Multi-poster issues hardened:
@@ -39,8 +39,8 @@ local DEFAULTS = {
   width = 160,
   lineHeight = 13,
 
-  broadcastInterval = 0.20,
-  heartbeatInterval = 2.00,
+  broadcastInterval = 0.90,
+  heartbeatInterval = 3.00,
 
   staleTimeout = 120.0,
   fadeDuration = 10.0,
@@ -49,10 +49,10 @@ local DEFAULTS = {
   claimPostDelay = 0.75,      -- additional settle time after sending claim
   postVisibleSeconds = 20.0,
 
-  reqPulseInterval = 4.0,     -- periodic REQ during encounter
+  reqPulseInterval = 8.0,     -- periodic REQ during encounter
   endBurstSeconds = 2.0,      -- NEW: burst sync after ENCOUNTER_END
-  endBurstStateEvery = 0.40,  -- NEW: STATE interval during burst
-  endBurstReqEvery = 0.70,    -- NEW: REQ interval during burst
+  endBurstStateEvery = 0.90,  -- NEW: STATE interval during burst
+  endBurstReqEvery = 1.40,    -- NEW: REQ interval during burst
 
   postTopN = 5, -- min 5 enforced
 
@@ -102,13 +102,13 @@ local function GetGroupChannel()
   return nil
 end
 
-local function BuildGroupChannels()
+local function BuildSendChannelOrder()
   local out = {}
-  if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then
-    table.insert(out, "INSTANCE_CHAT")
-  end
   if IsInRaid() then
     table.insert(out, "RAID")
+  end
+  if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then
+    table.insert(out, "INSTANCE_CHAT")
   end
   if IsInGroup() then
     table.insert(out, "PARTY")
@@ -139,6 +139,26 @@ local lastHeartbeatAt = 0
 local pendingBroadcast = false
 local lastReqPulseAt = 0
 
+local SEND_ADDON_RESULT = {
+  Success = 0,
+  InvalidPrefix = 1,
+  InvalidMessage = 2,
+  AddonMessageThrottle = 3,
+  InvalidChatType = 4,
+  NotInGroup = 5,
+  TargetRequired = 6,
+  InvalidChannel = 7,
+  ChannelThrottle = 8,
+  GeneralError = 9,
+  NotInGuild = 10,
+  AddOnMessageLockdown = 11,
+  TargetOffline = 12,
+}
+
+local pendingComm = { HELLO = nil, REQ = nil, S = nil, C = nil, P = nil }
+local commRetryTimer = nil
+local commBackoffUntil = 0
+
 -- End burst sync
 local endBurstUntil = 0
 local lastEndBurstStateAt = 0
@@ -166,6 +186,11 @@ end
 local function CancelChatRetry()
   if chatRetryTimer and chatRetryTimer.Cancel then chatRetryTimer:Cancel() end
   chatRetryTimer = nil
+end
+
+local function CancelCommRetry()
+  if commRetryTimer and commRetryTimer.Cancel then commRetryTimer:Cancel() end
+  commRetryTimer = nil
 end
 
 -- Throttle for hello/request spam
@@ -337,6 +362,30 @@ local function RegisterPrefix(prefix)
   return false
 end
 
+local function ExtractCommTag(msg)
+  if type(msg) ~= "string" then return nil end
+  return msg:match("^(%u+):")
+end
+
+local function HasPendingComm()
+  return pendingComm.P or pendingComm.C or pendingComm.S or pendingComm.HELLO or pendingComm.REQ
+end
+
+local function ScheduleCommRetry(delay)
+  if not HasPendingComm() then
+    CancelCommRetry()
+    return
+  end
+
+  local wait = tonumber(delay or 1.0) or 1.0
+  if wait < 0.10 then wait = 0.10 end
+
+  CancelCommRetry()
+  commRetryTimer = C_Timer.NewTimer(wait, function()
+    commRetryTimer = nil
+  end)
+end
+
 local function SendAddon(prefix, msg, ch)
   if C_ChatInfo and C_ChatInfo.SendAddonMessage then
     local result = C_ChatInfo.SendAddonMessage(prefix, msg, ch)
@@ -355,21 +404,77 @@ local function SendAddon(prefix, msg, ch)
   return false, "NoSendAPI"
 end
 
-local function SendComm(msg)
-  local channels = BuildGroupChannels()
+local function SendCommNow(msg)
+  local channels = BuildSendChannelOrder()
   if #channels == 0 then return false end
 
   for i = 1, #channels do
-    local ok = SendAddon(PREFIX, msg, channels[i])
+    local ok, result = SendAddon(PREFIX, msg, channels[i])
     if ok then
-      return true
+      return true, result
+    end
+
+    if result == SEND_ADDON_RESULT.AddonMessageThrottle or result == SEND_ADDON_RESULT.ChannelThrottle or result == SEND_ADDON_RESULT.AddOnMessageLockdown then
+      return false, result
     end
   end
 
-  local ch = GetGroupChannel()
-  if ch then
-    local ok = SendAddon(PREFIX, msg, ch)
-    if ok then return true end
+  return false, SEND_ADDON_RESULT.NotInGroup
+end
+
+local function QueuePendingComm(msg)
+  local tag = ExtractCommTag(msg)
+  if not tag then return false end
+  pendingComm[tag] = msg
+  ScheduleCommRetry(math.max(0.10, commBackoffUntil - Now()))
+  return true
+end
+
+local function FlushPendingComm()
+  if Now() < commBackoffUntil then return false end
+
+  local order = { "P", "C", "S", "HELLO", "REQ" }
+  for i = 1, #order do
+    local tag = order[i]
+    local msg = pendingComm[tag]
+    if msg then
+      local ok, result = SendCommNow(msg)
+      if ok then
+        pendingComm[tag] = nil
+      elseif result == SEND_ADDON_RESULT.AddonMessageThrottle or result == SEND_ADDON_RESULT.ChannelThrottle or result == SEND_ADDON_RESULT.AddOnMessageLockdown then
+        commBackoffUntil = Now() + ((tag == "P" or tag == "C") and 0.75 or 1.25)
+        ScheduleCommRetry(commBackoffUntil - Now())
+        return false
+      else
+        pendingComm[tag] = nil
+      end
+    end
+  end
+
+  if HasPendingComm() then
+    ScheduleCommRetry(0.75)
+    return false
+  end
+
+  CancelCommRetry()
+  return true
+end
+
+local function SendComm(msg)
+  if Now() < commBackoffUntil then
+    QueuePendingComm(msg)
+    return false
+  end
+
+  local ok, result = SendCommNow(msg)
+  if ok then
+    return true
+  end
+
+  if result == SEND_ADDON_RESULT.AddonMessageThrottle or result == SEND_ADDON_RESULT.ChannelThrottle or result == SEND_ADDON_RESULT.AddOnMessageLockdown then
+    commBackoffUntil = Now() + 1.25
+    QueuePendingComm(msg)
+    return false
   end
 
   return false
@@ -479,8 +584,8 @@ local function SanitizeForChat(s)
 end
 
 local function IsChatSendSafe()
-  local hasGlobalSend = (type(SendChatMessage) == "function")
   local hasCAPI = (C_ChatInfo and type(C_ChatInfo.SendChatMessage) == "function")
+  local hasGlobalSend = (type(SendChatMessage) == "function")
   if not hasGlobalSend and not hasCAPI then return false end
 
   -- If chat send paths are tainted by another addon, do not attempt a protected send.
@@ -509,7 +614,15 @@ local function TrySendChatLine(msg, chatType)
   if msg == "" then return true end
   if not IsChatSendSafe() then return false end
 
-  -- Prefer securecallfunction to avoid protected-call taint during end-of-encounter transitions.
+  -- Prefer the current C_ChatInfo path before the deprecated global function.
+  if C_ChatInfo and type(C_ChatInfo.SendChatMessage) == "function" then
+    local ok = pcall(function()
+      C_ChatInfo.SendChatMessage(msg, chatType)
+    end)
+    if ok then return true end
+  end
+
+  -- Fall back to the global function on older clients.
   if type(securecallfunction) == "function" and type(SendChatMessage) == "function" then
     local ok = pcall(function()
       securecallfunction(SendChatMessage, msg, chatType)
@@ -517,10 +630,9 @@ local function TrySendChatLine(msg, chatType)
     return ok
   end
 
-  -- Fallback for clients where securecallfunction is unavailable.
-  if C_ChatInfo and type(C_ChatInfo.SendChatMessage) == "function" then
+  if type(SendChatMessage) == "function" then
     local ok = pcall(function()
-      C_ChatInfo.SendChatMessage(msg, chatType)
+      SendChatMessage(msg, chatType)
     end)
     return ok
   end
@@ -764,6 +876,10 @@ local function BeginEncounter(newID, newName)
   encounterName = newName or "Encounter"
   encounterSuccess = nil
 
+  pendingComm = { HELLO = nil, REQ = nil, S = nil, C = nil, P = nil }
+  commBackoffUntil = 0
+  CancelCommRetry()
+
   myJumps = 0
 
   wipe(totals)
@@ -822,6 +938,9 @@ end
 local function EndEncounterUI()
   phase = "idle"
   CancelPostTimer()
+  pendingComm = { HELLO = nil, REQ = nil, S = nil, C = nil, P = nil }
+  commBackoffUntil = 0
+  CancelCommRetry()
   UpdateUI()
 end
 
@@ -1046,6 +1165,10 @@ f:RegisterEvent("GROUP_ROSTER_UPDATE")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
 
 ui:SetScript("OnUpdate", function(self, elapsed)
+  if HasPendingComm() and not commRetryTimer and Now() >= commBackoffUntil then
+    FlushPendingComm()
+  end
+
   if phase == "idle" then return end
 
   if phase == "active" then
