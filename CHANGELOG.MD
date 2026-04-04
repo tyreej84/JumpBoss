@@ -4,6 +4,19 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.3.4
+### Fixed
+- Fixed missing live leaderboard updates during encounters for some users:
+  - Encounter comm/heartbeat processing now runs on the main addon frame update loop instead of the UI frame update loop.
+  - Live sync now continues even when the display frame is hidden.
+
+- Fixed protected chat call regressions during boss fights:
+  - Auto leaderboard chat posting is now hard-blocked while encounter phase is `active`.
+  - Added explicit handling for `ADDON_ACTION_FORBIDDEN` tied to chat send paths to prevent repeated retry attempts in unsafe UI states.
+
+### Notes
+- Mid-fight communication remains addon-message based; only end-of-encounter results are eligible for chat posting.
+
 ## 1.3.3
 ### Fixed
 - Fixed live addon comm delivery to avoid over-sending and silent mid-fight drops:

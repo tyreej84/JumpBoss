@@ -1,5 +1,5 @@
 -- JumpBoss.lua
--- v1.3.3
+-- v1.3.4
 --
 -- Fixes / Improvements:
 --  - FIX: Multi-poster issues hardened:
@@ -175,6 +175,7 @@ local pendingChatLines = nil
 local waitingForRegen = false
 local chatRetryTimer = nil
 local lastRegenAt = 0
+local chatPostingBlocked = false
 
 local lastJumpAt = 0
 
@@ -585,14 +586,14 @@ end
 
 local function IsChatSendSafe()
   local hasCAPI = (C_ChatInfo and type(C_ChatInfo.SendChatMessage) == "function")
-  local hasGlobalSend = (type(SendChatMessage) == "function")
-  if not hasGlobalSend and not hasCAPI then return false end
+  if not hasCAPI then return false end
+  if chatPostingBlocked then return false end
+  if phase == "active" then return false end
 
   -- If chat send paths are tainted by another addon, do not attempt a protected send.
   if type(issecurevariable) == "function" then
-    local secureGlobal = issecurevariable("SendChatMessage")
     local secureCAPI = issecurevariable(C_ChatInfo, "SendChatMessage")
-    if secureGlobal == false or secureCAPI == false then
+    if secureCAPI ~= true then
       return false
     end
   end
@@ -614,27 +615,12 @@ local function TrySendChatLine(msg, chatType)
   if msg == "" then return true end
   if not IsChatSendSafe() then return false end
 
-  -- Prefer the current C_ChatInfo path before the deprecated global function.
+  -- Use only the current C_ChatInfo path to avoid deprecated/taint-prone global fallbacks.
   if C_ChatInfo and type(C_ChatInfo.SendChatMessage) == "function" then
     local ok = pcall(function()
       C_ChatInfo.SendChatMessage(msg, chatType)
     end)
     if ok then return true end
-  end
-
-  -- Fall back to the global function on older clients.
-  if type(securecallfunction) == "function" and type(SendChatMessage) == "function" then
-    local ok = pcall(function()
-      securecallfunction(SendChatMessage, msg, chatType)
-    end)
-    return ok
-  end
-
-  if type(SendChatMessage) == "function" then
-    local ok = pcall(function()
-      SendChatMessage(msg, chatType)
-    end)
-    return ok
   end
 
   return false
@@ -646,19 +632,28 @@ local function TryFlushChatQueue()
     return true
   end
 
+  local lines = pendingChatLines
+
   if not IsChatSendSafe() then return false end
 
   local ch = GetGroupChannel()
   if not ch then return false end
 
-  for i = 1, #pendingChatLines do
-    local ok = TrySendChatLine(pendingChatLines[i], ch)
+  for i = 1, #lines do
+    -- Another handler may clear/replace the queue while we are flushing.
+    if pendingChatLines ~= lines then
+      return false
+    end
+
+    local ok = TrySendChatLine(lines[i], ch)
     if not ok then
       return false
     end
   end
 
-  pendingChatLines = nil
+  if pendingChatLines == lines then
+    pendingChatLines = nil
+  end
   return true
 end
 
@@ -683,6 +678,7 @@ end
 
 local function QueueChatPost(lines)
   if not lines or #lines == 0 then return end
+  if phase == "active" then return end
   pendingChatLines = lines
 
   if not IsChatSendSafe() then
@@ -875,6 +871,7 @@ local function BeginEncounter(newID, newName)
   encounterID = newID or 0
   encounterName = newName or "Encounter"
   encounterSuccess = nil
+  chatPostingBlocked = false
 
   pendingComm = { HELLO = nil, REQ = nil, S = nil, C = nil, P = nil }
   commBackoffUntil = 0
@@ -1123,6 +1120,19 @@ f:SetScript("OnEvent", function(self, event, ...)
     return
   end
 
+  if event == "ADDON_ACTION_FORBIDDEN" then
+    local addonName, addonFunc = ...
+    if addonName == ADDON_NAME and type(addonFunc) == "string" and addonFunc:find("SendChatMessage", 1, true) then
+      chatPostingBlocked = true
+      pendingChatLines = nil
+      waitingForRegen = false
+      CancelChatRetry()
+      f:UnregisterEvent("PLAYER_REGEN_ENABLED")
+      print("JumpBoss: auto leaderboard posting blocked by protected UI state this session.")
+    end
+    return
+  end
+
   if event == "ENCOUNTER_START" then
     local encID, encName = ...
     BeginEncounter(encID, encName)
@@ -1155,6 +1165,7 @@ end)
 
 f:RegisterEvent("ADDON_LOADED")
 f:RegisterEvent("CHAT_MSG_ADDON")
+f:RegisterEvent("ADDON_ACTION_FORBIDDEN")
 f:RegisterEvent("ENCOUNTER_START")
 f:RegisterEvent("ENCOUNTER_END")
 -- Register PLAYER_JUMP when the client supports it; fallback hook above remains active.
@@ -1164,7 +1175,7 @@ end)
 f:RegisterEvent("GROUP_ROSTER_UPDATE")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
 
-ui:SetScript("OnUpdate", function(self, elapsed)
+f:SetScript("OnUpdate", function(self, elapsed)
   if HasPendingComm() and not commRetryTimer and Now() >= commBackoffUntil then
     FlushPendingComm()
   end
