@@ -4,6 +4,17 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.3.5
+### Fixed
+- Fixed an additional leaderboard posting race found in live error logs:
+  - Chat queue flushing now snapshots the pending queue and aborts safely if the queue changes during send attempts.
+  - Prevents `pendingChatLines` nil-index errors during deferred post-combat posting.
+
+### Improved
+- Release and sync stability:
+  - Keeps encounter comm processing on the main addon frame update loop for reliable live updates.
+  - Keeps automatic chat posting blocked during active encounter phase to avoid protected call issues.
+
 ## 1.3.4
 ### Fixed
 - Fixed missing live leaderboard updates during encounters for some users:
