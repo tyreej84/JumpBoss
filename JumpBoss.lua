@@ -1,5 +1,5 @@
 -- JumpBoss.lua
--- v1.3.5
+-- v1.3.6
 --
 -- Fixes / Improvements:
 --  - FIX: Multi-poster issues hardened:
@@ -585,15 +585,17 @@ local function SanitizeForChat(s)
 end
 
 local function IsChatSendSafe()
+  local hasGlobal = (type(SendChatMessage) == "function")
   local hasCAPI = (C_ChatInfo and type(C_ChatInfo.SendChatMessage) == "function")
-  if not hasCAPI then return false end
+  if not hasGlobal and not hasCAPI then return false end
   if chatPostingBlocked then return false end
   if phase == "active" then return false end
 
   -- If chat send paths are tainted by another addon, do not attempt a protected send.
   if type(issecurevariable) == "function" then
-    local secureCAPI = issecurevariable(C_ChatInfo, "SendChatMessage")
-    if secureCAPI ~= true then
+    local secureGlobal = issecurevariable("SendChatMessage")
+    local secureCAPI = hasCAPI and issecurevariable(C_ChatInfo, "SendChatMessage")
+    if secureGlobal ~= true and secureCAPI ~= true then
       return false
     end
   end
@@ -615,7 +617,15 @@ local function TrySendChatLine(msg, chatType)
   if msg == "" then return true end
   if not IsChatSendSafe() then return false end
 
-  -- Use only the current C_ChatInfo path to avoid deprecated/taint-prone global fallbacks.
+  -- Prefer securecallfunction to avoid tainting protected SendChatMessage paths.
+  if type(securecallfunction) == "function" and type(SendChatMessage) == "function" then
+    local ok = pcall(function()
+      securecallfunction(SendChatMessage, msg, chatType)
+    end)
+    if ok then return true end
+  end
+
+  -- Fallback for clients where the global path is unavailable.
   if C_ChatInfo and type(C_ChatInfo.SendChatMessage) == "function" then
     local ok = pcall(function()
       C_ChatInfo.SendChatMessage(msg, chatType)

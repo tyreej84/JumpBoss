@@ -4,6 +4,12 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.3.6
+### Fixed
+- Fixed another protected chat posting fault found in BugGrabber:
+  - Chat posting now prefers `securecallfunction(SendChatMessage, ...)` and only falls back to `C_ChatInfo.SendChatMessage` when needed.
+  - Chat safety gating now accepts either secure global or secure C API send paths before attempting any send.
+
 ## 1.3.5
 ### Fixed
 - Fixed an additional leaderboard posting race found in live error logs:
@@ -17,7 +23,6 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ## 1.3.4
 ### Fixed
-- Fixed missing live leaderboard updates during encounters for some users:
   - Encounter comm/heartbeat processing now runs on the main addon frame update loop instead of the UI frame update loop.
   - Live sync now continues even when the display frame is hidden.
 
