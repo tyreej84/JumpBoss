@@ -4,6 +4,18 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.3.8
+### Fixed
+- Fully adapted to Midnight (Patch 12.0) combat communication lockdown:
+  - Incoming addon messages received while in combat lockdown are now silently discarded. Under current API rules, all addon channel data is encrypted and unreadable during an active instance encounter, so processing them is meaningless.
+  - End-of-encounter burst sync window is now reset when `PLAYER_REGEN_ENABLED` fires. Previously, if the encounter ended while still in combat, the burst window could expire before comms were unblocked, resulting in no post-combat convergence sync. The window now starts fresh as soon as combat drops.
+  - Fixed winner arbitration when `ENCOUNTER_END` fires while all players are still in combat. Previously, each player would see only their own data at arbitration time and all would post their own solo result. The final post commit is now deferred to post-combat, where cross-player sync has propagated and only the true winner posts.
+  - When a `POSTED` lock is received from another player, any locally queued chat post is now immediately cancelled.
+
+### Notes
+- Live cross-player jump counts during a boss fight are no longer possible under current API rules. Each player tracks their own jumps locally during combat.
+- Full sync, winner arbitration, and leaderboard posting all happen in the post-combat window after `ENCOUNTER_END` + `PLAYER_REGEN_ENABLED`.
+
 ## 1.3.7
 ### Fixed
 - Enforced no outbound sync sends while in combat:

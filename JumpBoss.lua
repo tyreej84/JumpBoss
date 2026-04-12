@@ -1,5 +1,5 @@
 -- JumpBoss.lua
--- v1.3.7
+-- v1.3.8
 --
 -- Fixes / Improvements:
 --  - FIX: Multi-poster issues hardened:
@@ -14,7 +14,7 @@
 --  - Posting: claim arbitration uses FULL names for deterministic tie-break
 --  - Chat: one player per line (plus header)
 --  - Safety: uses guarded C_ChatInfo.SendChatMessage path only (avoids deprecated global wrapper path)
---  - Comms: defers outbound sync traffic while in combat and flushes after combat
+--  - Comms: no sync in or out during combat (Midnight/12.0 lockdown); defers and flushes after regen
 --  - Comms: validates SendAddonMessage result codes and fails over across INSTANCE_CHAT/RAID/PARTY
 --  - Safety: hard-sanitizes '|' -> '||' to avoid invalid escape codes
 --
@@ -170,6 +170,7 @@ local claimWinnerFull = nil
 local claimWinnerCount = 0
 local postedByFull = nil
 local postTimer = nil
+local needsPostCombatArbiter = false  -- true when post timer fired in combat; re-evaluated on regen
 
 -- Chat queue (combat/taint-safe posting)
 local pendingChatLines = nil
@@ -879,6 +880,16 @@ local function HandleEncounterEndPosting()
         local finalWinner = select(1, FinalWinnerFull())
         if finalWinner ~= myName then return end
 
+        -- If still in combat, we can't get cross-player sync; defer winner commit to regen.
+        if IsCombatSyncBlocked() then
+          needsPostCombatArbiter = true
+          if not waitingForRegen then
+            waitingForRegen = true
+            f:RegisterEvent("PLAYER_REGEN_ENABLED")
+          end
+          return
+        end
+
         -- Lock first (burst), then queue chat (deferred + retry)
         postedByFull = myName
         SendPostedBurst(myName)
@@ -924,6 +935,7 @@ local function BeginEncounter(newID, newName)
   CancelPostTimer()
 
   pendingChatLines = nil
+  needsPostCombatArbiter = false
   waitingForRegen = false
   lastRegenAt = 0
   CancelChatRetry()
@@ -979,6 +991,9 @@ local function NormalizeSender(sender)
 end
 
 local function OnAddonMessage(prefix, msg, channel, sender)
+  -- Blizzard Midnight (12.0): all addon comms are encrypted/unavailable during
+  -- combat inside instances. Discard incoming messages while in combat lockdown.
+  if IsCombatSyncBlocked() then return end
   if prefix ~= PREFIX then return end
   if type(msg) ~= "string" then return end
 
@@ -1045,9 +1060,13 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     if not enc or not posterFull or posterFull == "" then return end
     if enc ~= encounterID then return end
 
-    -- Hard stop: someone posted; cancel any scheduled post.
+    -- Hard stop: someone posted; cancel any scheduled post and any pending chat.
     postedByFull = posterFull
     CancelPostTimer()
+    if posterFull ~= myName then
+      pendingChatLines = nil
+      CancelChatRetry()
+    end
     return
   end
 end
@@ -1123,6 +1142,37 @@ f:SetScript("OnEvent", function(self, event, ...)
 
   if event == "PLAYER_REGEN_ENABLED" then
     lastRegenAt = Now()
+
+    -- If encounter ended while in combat, reset the end-burst window now so
+    -- the first available post-combat tick triggers a full convergence sync.
+    if phase == "ended" then
+      local burst = db.endBurstSeconds or DEFAULTS.endBurstSeconds
+      endBurstUntil = Now() + burst
+      lastEndBurstStateAt = 0
+      lastEndBurstReqAt = 0
+    end
+
+    -- If the post timer fired during combat and deferred, re-evaluate winner now.
+    if needsPostCombatArbiter and phase == "ended" and not postedByFull then
+      needsPostCombatArbiter = false
+      local gather = db.claimPostDelay or DEFAULTS.claimPostDelay
+      -- Brief settle so end-burst STATE/CLAIM messages have time to propagate.
+      C_Timer.After(0.80, function()
+        if phase ~= "ended" or postedByFull then return end
+        local winnerFull = select(1, FinalWinnerFull())
+        if not winnerFull or winnerFull ~= myName then return end
+        local delay = DeterministicDelaySeconds(myName)
+        postTimer = C_Timer.NewTimer(delay, function()
+          postTimer = nil
+          if postedByFull then return end
+          local finalWinner = select(1, FinalWinnerFull())
+          if finalWinner ~= myName then return end
+          postedByFull = myName
+          SendPostedBurst(myName)
+          QueueChatPost(BuildChatLines())
+        end)
+      end)
+    end
 
     if pendingChatLines then
       -- Give the client a brief settle window after leaving combat.
