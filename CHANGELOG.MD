@@ -4,6 +4,16 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.3.7
+### Fixed
+- Enforced no outbound sync sends while in combat:
+  - `HELLO`, `REQ`, `STATE`, `CLAIM`, and `POSTED` comm traffic is deferred during combat and flushed after `PLAYER_REGEN_ENABLED`.
+  - Prevents repeated mid-combat sync attempts under combat-time channel restrictions.
+
+- Hardened protected chat posting path from BugGrabber findings:
+  - Removed global `SendChatMessage` send path usage.
+  - Auto posting now uses guarded `C_ChatInfo.SendChatMessage` only.
+
 ## 1.3.6
 ### Fixed
 - Fixed another protected chat posting fault found in BugGrabber:

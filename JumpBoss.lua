@@ -1,5 +1,5 @@
 -- JumpBoss.lua
--- v1.3.6
+-- v1.3.7
 --
 -- Fixes / Improvements:
 --  - FIX: Multi-poster issues hardened:
@@ -13,7 +13,8 @@
 --  - Posting: posts on BOTH wipes and kills (ENCOUNTER_END), winner-only
 --  - Posting: claim arbitration uses FULL names for deterministic tie-break
 --  - Chat: one player per line (plus header)
---  - Safety: prefers securecallfunction(SendChatMessage, ...) with guarded C_ChatInfo.SendChatMessage fallback
+--  - Safety: uses guarded C_ChatInfo.SendChatMessage path only (avoids deprecated global wrapper path)
+--  - Comms: defers outbound sync traffic while in combat and flushes after combat
 --  - Comms: validates SendAddonMessage result codes and fails over across INSTANCE_CHAT/RAID/PARTY
 --  - Safety: hard-sanitizes '|' -> '||' to avoid invalid escape codes
 --
@@ -387,6 +388,10 @@ local function ScheduleCommRetry(delay)
   end)
 end
 
+local function IsCombatSyncBlocked()
+  return (InCombatLockdown and InCombatLockdown()) or (UnitAffectingCombat and UnitAffectingCombat("player"))
+end
+
 local function SendAddon(prefix, msg, ch)
   if C_ChatInfo and C_ChatInfo.SendAddonMessage then
     local result = C_ChatInfo.SendAddonMessage(prefix, msg, ch)
@@ -406,6 +411,10 @@ local function SendAddon(prefix, msg, ch)
 end
 
 local function SendCommNow(msg)
+  if IsCombatSyncBlocked() then
+    return false, SEND_ADDON_RESULT.AddOnMessageLockdown
+  end
+
   local channels = BuildSendChannelOrder()
   if #channels == 0 then return false end
 
@@ -432,6 +441,14 @@ local function QueuePendingComm(msg)
 end
 
 local function FlushPendingComm()
+  if IsCombatSyncBlocked() then
+    if not waitingForRegen then
+      waitingForRegen = true
+      f:RegisterEvent("PLAYER_REGEN_ENABLED")
+    end
+    return false
+  end
+
   if Now() < commBackoffUntil then return false end
 
   local order = { "P", "C", "S", "HELLO", "REQ" }
@@ -462,6 +479,15 @@ local function FlushPendingComm()
 end
 
 local function SendComm(msg)
+  if IsCombatSyncBlocked() then
+    QueuePendingComm(msg)
+    if not waitingForRegen then
+      waitingForRegen = true
+      f:RegisterEvent("PLAYER_REGEN_ENABLED")
+    end
+    return false
+  end
+
   if Now() < commBackoffUntil then
     QueuePendingComm(msg)
     return false
@@ -585,17 +611,15 @@ local function SanitizeForChat(s)
 end
 
 local function IsChatSendSafe()
-  local hasGlobal = (type(SendChatMessage) == "function")
   local hasCAPI = (C_ChatInfo and type(C_ChatInfo.SendChatMessage) == "function")
-  if not hasGlobal and not hasCAPI then return false end
+  if not hasCAPI then return false end
   if chatPostingBlocked then return false end
   if phase == "active" then return false end
 
   -- If chat send paths are tainted by another addon, do not attempt a protected send.
   if type(issecurevariable) == "function" then
-    local secureGlobal = issecurevariable("SendChatMessage")
-    local secureCAPI = hasCAPI and issecurevariable(C_ChatInfo, "SendChatMessage")
-    if secureGlobal ~= true and secureCAPI ~= true then
+    local secureCAPI = issecurevariable(C_ChatInfo, "SendChatMessage")
+    if secureCAPI ~= true then
       return false
     end
   end
@@ -617,15 +641,6 @@ local function TrySendChatLine(msg, chatType)
   if msg == "" then return true end
   if not IsChatSendSafe() then return false end
 
-  -- Prefer securecallfunction to avoid tainting protected SendChatMessage paths.
-  if type(securecallfunction) == "function" and type(SendChatMessage) == "function" then
-    local ok = pcall(function()
-      securecallfunction(SendChatMessage, msg, chatType)
-    end)
-    if ok then return true end
-  end
-
-  -- Fallback for clients where the global path is unavailable.
   if C_ChatInfo and type(C_ChatInfo.SendChatMessage) == "function" then
     local ok = pcall(function()
       C_ChatInfo.SendChatMessage(msg, chatType)
@@ -1108,8 +1123,6 @@ f:SetScript("OnEvent", function(self, event, ...)
 
   if event == "PLAYER_REGEN_ENABLED" then
     lastRegenAt = Now()
-    waitingForRegen = false
-    f:UnregisterEvent("PLAYER_REGEN_ENABLED")
 
     if pendingChatLines then
       -- Give the client a brief settle window after leaving combat.
@@ -1120,6 +1133,18 @@ f:SetScript("OnEvent", function(self, event, ...)
           ScheduleChatRetry()
         end
       end)
+    end
+
+    if HasPendingComm() then
+      local ok = FlushPendingComm()
+      if not ok and HasPendingComm() then
+        ScheduleCommRetry(0.60)
+      end
+    end
+
+    if not pendingChatLines and not HasPendingComm() then
+      waitingForRegen = false
+      f:UnregisterEvent("PLAYER_REGEN_ENABLED")
     end
     return
   end
