@@ -4,6 +4,15 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.3.9
+### Fixed
+- Updated addon metadata for WoW Patch 12.0.5:
+  - Bumped TOC `Interface` to `120005` so the addon is recognized as current for 12.0.5 clients.
+  - Carried forward the 12.0 combat-lockdown-safe communication model from 1.3.8 with no behavior regressions.
+
+### Notes
+- Runtime logic remains unchanged from 1.3.8; this is a compatibility/metadata release for 12.0.5.
+
 ## 1.3.8
 ### Fixed
 - Fully adapted to Midnight (Patch 12.0) combat communication lockdown:

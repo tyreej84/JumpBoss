@@ -1,5 +1,5 @@
 -- JumpBoss.lua
--- v1.3.8
+-- v1.3.9
 --
 -- Fixes / Improvements:
 --  - FIX: Multi-poster issues hardened:
