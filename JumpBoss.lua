@@ -1,5 +1,5 @@
 -- JumpBoss.lua
--- v1.3.9
+-- v1.4.1
 --
 -- Fixes / Improvements:
 --  - FIX: Multi-poster issues hardened:
@@ -9,6 +9,7 @@
 --  - FIX: ADDON_ACTION_FORBIDDEN / UNKNOWN():
 --      * Never posts chat in ENCOUNTER_END call stack (always deferred)
 --      * Chat posting is queued + retries (combat-safe + taint-safe-ish)
+--  - FIX: Handles ADDON_ACTION_BLOCKED same as ADDON_ACTION_FORBIDDEN for safe chat-post disable
 --  - Live updates: debounced JumpOrAscendStart hook + periodic REQ pulse during encounter
 --  - Posting: posts on BOTH wipes and kills (ENCOUNTER_END), winner-only
 --  - Posting: claim arbitration uses FULL names for deterministic tie-break
@@ -174,6 +175,7 @@ local needsPostCombatArbiter = false  -- true when post timer fired in combat; r
 
 -- Chat queue (combat/taint-safe posting)
 local pendingChatLines = nil
+local pendingChatNextIndex = 1
 local waitingForRegen = false
 local chatRetryTimer = nil
 local lastRegenAt = 0
@@ -619,8 +621,9 @@ local function IsChatSendSafe()
 
   -- If chat send paths are tainted by another addon, do not attempt a protected send.
   if type(issecurevariable) == "function" then
+    local secureGlobal = issecurevariable("SendChatMessage")
     local secureCAPI = issecurevariable(C_ChatInfo, "SendChatMessage")
-    if secureCAPI ~= true then
+    if secureGlobal ~= true or secureCAPI ~= true then
       return false
     end
   end
@@ -655,6 +658,7 @@ end
 local function TryFlushChatQueue()
   if not pendingChatLines or #pendingChatLines == 0 then
     pendingChatLines = nil
+    pendingChatNextIndex = 1
     return true
   end
 
@@ -665,7 +669,8 @@ local function TryFlushChatQueue()
   local ch = GetGroupChannel()
   if not ch then return false end
 
-  for i = 1, #lines do
+  local startIndex = pendingChatNextIndex or 1
+  for i = startIndex, #lines do
     -- Another handler may clear/replace the queue while we are flushing.
     if pendingChatLines ~= lines then
       return false
@@ -673,12 +678,15 @@ local function TryFlushChatQueue()
 
     local ok = TrySendChatLine(lines[i], ch)
     if not ok then
+      pendingChatNextIndex = i
       return false
     end
+    pendingChatNextIndex = i + 1
   end
 
   if pendingChatLines == lines then
     pendingChatLines = nil
+    pendingChatNextIndex = 1
   end
   return true
 end
@@ -706,6 +714,7 @@ local function QueueChatPost(lines)
   if not lines or #lines == 0 then return end
   if phase == "active" then return end
   pendingChatLines = lines
+  pendingChatNextIndex = 1
 
   if not IsChatSendSafe() then
     if not waitingForRegen then
@@ -935,6 +944,7 @@ local function BeginEncounter(newID, newName)
   CancelPostTimer()
 
   pendingChatLines = nil
+  pendingChatNextIndex = 1
   needsPostCombatArbiter = false
   waitingForRegen = false
   lastRegenAt = 0
@@ -1065,6 +1075,7 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     CancelPostTimer()
     if posterFull ~= myName then
       pendingChatLines = nil
+      pendingChatNextIndex = 1
       CancelChatRetry()
     end
     return
@@ -1205,11 +1216,12 @@ f:SetScript("OnEvent", function(self, event, ...)
     return
   end
 
-  if event == "ADDON_ACTION_FORBIDDEN" then
+  if event == "ADDON_ACTION_FORBIDDEN" or event == "ADDON_ACTION_BLOCKED" then
     local addonName, addonFunc = ...
     if addonName == ADDON_NAME and type(addonFunc) == "string" and addonFunc:find("SendChatMessage", 1, true) then
       chatPostingBlocked = true
       pendingChatLines = nil
+      pendingChatNextIndex = 1
       waitingForRegen = false
       CancelChatRetry()
       f:UnregisterEvent("PLAYER_REGEN_ENABLED")
@@ -1251,6 +1263,7 @@ end)
 f:RegisterEvent("ADDON_LOADED")
 f:RegisterEvent("CHAT_MSG_ADDON")
 f:RegisterEvent("ADDON_ACTION_FORBIDDEN")
+f:RegisterEvent("ADDON_ACTION_BLOCKED")
 f:RegisterEvent("ENCOUNTER_START")
 f:RegisterEvent("ENCOUNTER_END")
 -- Register PLAYER_JUMP when the client supports it; fallback hook above remains active.

@@ -4,6 +4,24 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.4.1 - 2026-04-23
+### Fixed
+- Hardened chat-send safety gating again after fresh BugGrabber findings:
+  - Chat posting now also refuses sends when the global `SendChatMessage` path is tainted, not just when `C_ChatInfo.SendChatMessage` is tainted.
+  - Reduces the chance of hitting an initial `[ADDON_ACTION_BLOCKED] ... SendChatMessage()` before the session-level safety shutoff engages.
+
+### Notes
+- This is a follow-up safety hardening release for end-of-encounter chat posting.
+
+## 1.4.0 - 2026-04-22
+### Fixed
+- Hardened protected chat-post handling from BugGrabber findings:
+  - Added explicit handling for `ADDON_ACTION_BLOCKED` in the same safety path as `ADDON_ACTION_FORBIDDEN`.
+  - Registered `ADDON_ACTION_BLOCKED` so JumpBoss disables auto posting safely if the client blocks `SendChatMessage()`.
+
+### Notes
+- This is a safety hardening change for post-encounter chat posting behavior; core encounter tracking logic is unchanged.
+
 ## 1.3.9
 ### Fixed
 - Updated addon metadata for WoW Patch 12.0.5:
