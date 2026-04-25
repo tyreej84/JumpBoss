@@ -4,6 +4,15 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.4.2 - 2026-04-25
+### Fixed
+- Tightened post-encounter chat posting safety for 12.0.5 taint conditions:
+  - Chat queue send attempts now use only guarded `securecallfunction(C_ChatInfo.SendChatMessage, ...)` execution.
+  - Removed the direct fallback send call path so blocked protected sends fail closed and remain queued/retriable.
+
+### Notes
+- This release focuses on reducing `[ADDON_ACTION_BLOCKED] ... SendChatMessage()` exposure during taint-heavy sessions.
+
 ## 1.4.1 - 2026-04-23
 ### Fixed
 - Hardened chat-send safety gating again after fresh BugGrabber findings:
