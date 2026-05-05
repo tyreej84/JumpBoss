@@ -1216,14 +1216,18 @@ f:SetScript("OnEvent", function(self, event, ...)
 
   if event == "ADDON_ACTION_FORBIDDEN" or event == "ADDON_ACTION_BLOCKED" then
     local addonName, addonFunc = ...
-    if addonName == ADDON_NAME and type(addonFunc) == "string" and addonFunc:find("SendChatMessage", 1, true) then
+    if addonName == ADDON_NAME then
       chatPostingBlocked = true
       pendingChatLines = nil
       pendingChatNextIndex = 1
       waitingForRegen = false
       CancelChatRetry()
       f:UnregisterEvent("PLAYER_REGEN_ENABLED")
-      print("JumpBoss: auto leaderboard posting blocked by protected UI state this session.")
+      if type(addonFunc) == "string" and addonFunc ~= "" then
+        print(string.format("JumpBoss: auto leaderboard posting blocked by protected UI state this session (%s).", addonFunc))
+      else
+        print("JumpBoss: auto leaderboard posting blocked by protected UI state this session.")
+      end
     end
     return
   end

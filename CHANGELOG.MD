@@ -4,6 +4,15 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.4.3 - 2026-05-05
+### Fixed
+- Hardened protected-action fallback for chat posting safety:
+  - Any `ADDON_ACTION_FORBIDDEN` or `ADDON_ACTION_BLOCKED` event attributed to JumpBoss now disables auto leaderboard posting for the current session.
+  - Covers blocked function names that are reported as `UNKNOWN()` by the client, not only explicit `SendChatMessage` paths.
+
+### Notes
+- This prevents repeated protected-action attempts after the first blocked event and keeps encounter tracking unaffected.
+
 ## 1.4.2 - 2026-04-25
 ### Fixed
 - Tightened post-encounter chat posting safety for 12.0.5 taint conditions:
