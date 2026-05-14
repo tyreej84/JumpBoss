@@ -1,0 +1,1296 @@
+-- JumpBoss.lua
+-- v1.4.1
+--
+-- Fixes / Improvements:
+--  - FIX: Multi-poster issues hardened:
+--      * Burst end-of-encounter sync (extra STATE/REQ for 2s) to improve convergence
+--      * Winner sends POSTED lock (P:) multiple times for reliability
+--      * Claims (C:) are re-broadcast to reduce loss-based divergence
+--  - FIX: ADDON_ACTION_FORBIDDEN / UNKNOWN():
+--      * Never posts chat in ENCOUNTER_END call stack (always deferred)
+--      * Chat posting is queued + retries (combat-safe + taint-safe-ish)
+--  - FIX: Handles ADDON_ACTION_BLOCKED same as ADDON_ACTION_FORBIDDEN for safe chat-post disable
+--  - Live updates: debounced JumpOrAscendStart hook + periodic REQ pulse during encounter
+--  - Posting: posts on BOTH wipes and kills (ENCOUNTER_END), winner-only
+--  - Posting: claim arbitration uses FULL names for deterministic tie-break
+--  - Chat: one player per line (plus header)
+--  - Safety: uses guarded C_ChatInfo.SendChatMessage path only (avoids deprecated global wrapper path)
+--  - Comms: no sync in or out during combat (Midnight/12.0 lockdown); defers and flushes after regen
+--  - Comms: validates SendAddonMessage result codes and fails over across INSTANCE_CHAT/RAID/PARTY
+--  - Safety: hard-sanitizes '|' -> '||' to avoid invalid escape codes
+--
+-- Notes:
+--  - Tracks only JumpBoss users who jumped at least once.
+--  - Comms channel: RAID first, then INSTANCE_CHAT, then PARTY.
+
+local ADDON_NAME = ...
+local PREFIX = "JBT1"
+
+local f = CreateFrame("Frame")
+local db
+
+-- -----------------------------
+-- Defaults
+-- -----------------------------
+local DEFAULTS = {
+  show = true,
+  locked = false,
+  scale = 1.0,
+
+  maxLines = 5,
+  width = 160,
+  lineHeight = 13,
+
+  broadcastInterval = 0.90,
+  heartbeatInterval = 3.00,
+
+  staleTimeout = 120.0,
+  fadeDuration = 10.0,
+
+  syncWindow = 5.0,           -- time to let STATE/claims settle before selecting winner
+  claimPostDelay = 0.75,      -- additional settle time after sending claim
+  postVisibleSeconds = 20.0,
+
+  reqPulseInterval = 8.0,     -- periodic REQ during encounter
+  endBurstSeconds = 2.0,      -- NEW: burst sync after ENCOUNTER_END
+  endBurstStateEvery = 0.90,  -- NEW: STATE interval during burst
+  endBurstReqEvery = 1.40,    -- NEW: REQ interval during burst
+
+  postTopN = 5, -- min 5 enforced
+
+  pos = { point = "CENTER", relPoint = "CENTER", x = 0, y = 160 },
+}
+
+local function CopyDefaults(dst, src)
+  for k, v in pairs(src) do
+    if type(v) == "table" then
+      if type(dst[k]) ~= "table" then dst[k] = {} end
+      CopyDefaults(dst[k], v)
+    elseif dst[k] == nil then
+      dst[k] = v
+    end
+  end
+end
+
+local function Now() return GetTime() or 0 end
+
+local function PlayerFullName()
+  local name, realm = UnitName("player")
+  realm = realm or GetRealmName() or ""
+  if realm ~= "" and name and not name:find("-") then
+    return name .. "-" .. realm
+  end
+  return name or ""
+end
+
+local function ShortName(full)
+  if not full or full == "" then return "" end
+  return Ambiguate(full, "short")
+end
+
+local function Clamp(x, a, b)
+  if x < a then return a end
+  if x > b then return b end
+  return x
+end
+
+-- IMPORTANT:
+-- Prefer RAID first so everyone in a raid uses the same addon channel.
+-- Then INSTANCE_CHAT for LFG/instance parties, then PARTY.
+local function GetGroupChannel()
+  if IsInRaid() then return "RAID" end
+  if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then return "INSTANCE_CHAT" end
+  if IsInGroup() then return "PARTY" end
+  return nil
+end
+
+local function BuildSendChannelOrder()
+  local out = {}
+  if IsInRaid() then
+    table.insert(out, "RAID")
+  end
+  if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then
+    table.insert(out, "INSTANCE_CHAT")
+  end
+  if IsInGroup() then
+    table.insert(out, "PARTY")
+  end
+  return out
+end
+
+-- -----------------------------
+-- State
+-- -----------------------------
+local phase = "idle" -- "idle" | "active" | "ended"
+local encounterID = 0
+local encounterName = ""
+local encounterSuccess = nil -- boolean from ENCOUNTER_END if available
+
+local myName = ""
+local myShort = ""
+local myClass = ""
+local myJumps = 0
+
+local totals = {}      -- fullName -> jumps (ONLY jumpers)
+local lastSeen = {}    -- fullName -> timestamp
+local classByName = {} -- fullName -> classFile
+local jumped = {}      -- fullName -> true once jumped
+
+local lastBroadcastAt = 0
+local lastHeartbeatAt = 0
+local pendingBroadcast = false
+local lastReqPulseAt = 0
+
+local SEND_ADDON_RESULT = {
+  Success = 0,
+  InvalidPrefix = 1,
+  InvalidMessage = 2,
+  AddonMessageThrottle = 3,
+  InvalidChatType = 4,
+  NotInGroup = 5,
+  TargetRequired = 6,
+  InvalidChannel = 7,
+  ChannelThrottle = 8,
+  GeneralError = 9,
+  NotInGuild = 10,
+  AddOnMessageLockdown = 11,
+  TargetOffline = 12,
+}
+
+local pendingComm = { HELLO = nil, REQ = nil, S = nil, C = nil, P = nil }
+local commRetryTimer = nil
+local commBackoffUntil = 0
+
+-- End burst sync
+local endBurstUntil = 0
+local lastEndBurstStateAt = 0
+local lastEndBurstReqAt = 0
+
+-- Winner arbitration / posting lock (FULL names for determinism)
+local claimWinnerFull = nil
+local claimWinnerCount = 0
+local postedByFull = nil
+local postTimer = nil
+local needsPostCombatArbiter = false  -- true when post timer fired in combat; re-evaluated on regen
+
+-- Chat queue (combat/taint-safe posting)
+local pendingChatLines = nil
+local pendingChatNextIndex = 1
+local waitingForRegen = false
+local chatRetryTimer = nil
+local lastRegenAt = 0
+local chatPostingBlocked = false
+
+local lastJumpAt = 0
+
+local function CancelPostTimer()
+  if postTimer and postTimer.Cancel then postTimer:Cancel() end
+  postTimer = nil
+end
+
+local function CancelChatRetry()
+  if chatRetryTimer and chatRetryTimer.Cancel then chatRetryTimer:Cancel() end
+  chatRetryTimer = nil
+end
+
+local function CancelCommRetry()
+  if commRetryTimer and commRetryTimer.Cancel then commRetryTimer:Cancel() end
+  commRetryTimer = nil
+end
+
+-- Throttle for hello/request spam
+local throttle = { hello = 0, req = 0 }
+local function Throttled(key, window)
+  window = window or 1.0
+  local t = Now()
+  if throttle[key] and (t - throttle[key] < window) then return true end
+  throttle[key] = t
+  return false
+end
+
+-- -----------------------------
+-- UI
+-- -----------------------------
+local ui = CreateFrame("Frame", "JumpBossFrame", UIParent, "BackdropTemplate")
+ui:SetClampedToScreen(true)
+ui:SetMovable(true)
+ui:EnableMouse(true)
+ui:RegisterForDrag("LeftButton")
+ui:SetScript("OnDragStart", function(self)
+  if not db.locked then self:StartMoving() end
+end)
+ui:SetScript("OnDragStop", function(self)
+  self:StopMovingOrSizing()
+  local point, _, relPoint, x, y = self:GetPoint(1)
+  db.pos.point, db.pos.relPoint, db.pos.x, db.pos.y = point, relPoint, x, y
+end)
+
+ui:SetBackdrop({
+  bgFile = "Interface\\Buttons\\WHITE8x8",
+  edgeFile = nil,
+  tile = true, tileSize = 16, edgeSize = 0,
+  insets = { left = 0, right = 0, top = 0, bottom = 0 },
+})
+ui:SetBackdropColor(0, 0, 0, 0.55)
+
+ui.title = ui:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+ui.title:SetPoint("TOPLEFT", 6, -5)
+ui.title:SetText("JumpBoss")
+
+ui.sub = ui:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+ui.sub:SetPoint("TOPLEFT", ui.title, "BOTTOMLEFT", 0, -1)
+ui.sub:SetText("Not in encounter")
+
+ui.lines = {}
+
+local function ResizeUI()
+  local lines = db.maxLines or DEFAULTS.maxLines
+  local lineH = db.lineHeight or DEFAULTS.lineHeight
+  local w = db.width or DEFAULTS.width
+
+  local headerH = 26
+  local h = headerH + (lines * lineH) + 6
+  ui:SetSize(w, h)
+
+  for i = 1, lines do
+    if not ui.lines[i] then
+      ui.lines[i] = ui:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    end
+    local fs = ui.lines[i]
+    fs:ClearAllPoints()
+    fs:SetPoint("TOPLEFT", 6, -(headerH + (i - 1) * lineH))
+    fs:SetText("")
+    fs:SetAlpha(1)
+    fs:Show()
+  end
+
+  for i = lines + 1, #ui.lines do
+    ui.lines[i]:SetText("")
+    ui.lines[i]:Hide()
+  end
+end
+
+local function ApplyUISettings()
+  ui:SetScale(db.scale or 1.0)
+  ui:ClearAllPoints()
+  ui:SetPoint(db.pos.point, UIParent, db.pos.relPoint, db.pos.x, db.pos.y)
+  ui:SetShown(db.show)
+  ResizeUI()
+end
+
+local function NameColor(name)
+  local classFile = classByName[name]
+  if classFile and RAID_CLASS_COLORS and RAID_CLASS_COLORS[classFile] then
+    local c = RAID_CLASS_COLORS[classFile]
+    return c.r, c.g, c.b
+  end
+  return 1, 1, 1
+end
+
+local function BuildSortedVisibleTotals()
+  local t = Now()
+  local timeout = db.staleTimeout or DEFAULTS.staleTimeout
+  local fade = db.fadeDuration or DEFAULTS.fadeDuration
+
+  local arr = {}
+  for name, count in pairs(totals) do
+    if type(count) == "number" and count > 0 then
+      local seen = lastSeen[name]
+      if seen then
+        local age = t - seen
+        if age <= (timeout + fade) then
+          table.insert(arr, { name = name, count = count, age = age })
+        end
+      end
+    end
+  end
+
+  table.sort(arr, function(a, b)
+    if a.count ~= b.count then return a.count > b.count end
+    return a.name < b.name
+  end)
+
+  return arr
+end
+
+local function UpdateUI()
+  if not db.show then return end
+
+  if phase == "idle" then
+    ui.sub:SetText("Not in encounter")
+    for i = 1, (db.maxLines or DEFAULTS.maxLines) do
+      if ui.lines[i] then
+        ui.lines[i]:SetText("")
+        ui.lines[i]:SetAlpha(1)
+      end
+    end
+    return
+  end
+
+  ui.sub:SetText(string.format("You: %d", myJumps))
+
+  local arr = BuildSortedVisibleTotals()
+  local lines = db.maxLines or DEFAULTS.maxLines
+  local timeout = db.staleTimeout or DEFAULTS.staleTimeout
+  local fade = db.fadeDuration or DEFAULTS.fadeDuration
+
+  for i = 1, lines do
+    local fs = ui.lines[i]
+    local row = arr[i]
+    if row then
+      local alpha = 1
+      if row.age > timeout then
+        alpha = 1 - ((row.age - timeout) / math.max(0.01, fade))
+        alpha = Clamp(alpha, 0, 1)
+      end
+      local r, g, b = NameColor(row.name)
+      fs:SetText(string.format("%d. %s %d", i, ShortName(row.name), row.count))
+      fs:SetTextColor(r, g, b, 1)
+      fs:SetAlpha(alpha)
+    else
+      fs:SetText("")
+      fs:SetAlpha(1)
+    end
+  end
+end
+
+-- -----------------------------
+-- Addon comms
+-- -----------------------------
+local function RegisterPrefix(prefix)
+  if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
+    return C_ChatInfo.RegisterAddonMessagePrefix(prefix)
+  end
+  if RegisterAddonMessagePrefix then
+    return RegisterAddonMessagePrefix(prefix)
+  end
+  return false
+end
+
+local function ExtractCommTag(msg)
+  if type(msg) ~= "string" then return nil end
+  return msg:match("^(%u+):")
+end
+
+local function HasPendingComm()
+  return pendingComm.P or pendingComm.C or pendingComm.S or pendingComm.HELLO or pendingComm.REQ
+end
+
+local function ScheduleCommRetry(delay)
+  if not HasPendingComm() then
+    CancelCommRetry()
+    return
+  end
+
+  local wait = tonumber(delay or 1.0) or 1.0
+  if wait < 0.10 then wait = 0.10 end
+
+  CancelCommRetry()
+  commRetryTimer = C_Timer.NewTimer(wait, function()
+    commRetryTimer = nil
+  end)
+end
+
+local function IsCombatSyncBlocked()
+  return (InCombatLockdown and InCombatLockdown()) or (UnitAffectingCombat and UnitAffectingCombat("player"))
+end
+
+local function SendAddon(prefix, msg, ch)
+  if C_ChatInfo and C_ChatInfo.SendAddonMessage then
+    local result = C_ChatInfo.SendAddonMessage(prefix, msg, ch)
+    if result == nil or result == 0 then
+      return true, result
+    end
+    return false, result
+  end
+  if SendAddonMessage then
+    local ok = SendAddonMessage(prefix, msg, ch)
+    if ok == nil or ok == true then
+      return true, ok
+    end
+    return false, ok
+  end
+  return false, "NoSendAPI"
+end
+
+local function SendCommNow(msg)
+  if IsCombatSyncBlocked() then
+    return false, SEND_ADDON_RESULT.AddOnMessageLockdown
+  end
+
+  local channels = BuildSendChannelOrder()
+  if #channels == 0 then return false end
+
+  for i = 1, #channels do
+    local ok, result = SendAddon(PREFIX, msg, channels[i])
+    if ok then
+      return true, result
+    end
+
+    if result == SEND_ADDON_RESULT.AddonMessageThrottle or result == SEND_ADDON_RESULT.ChannelThrottle or result == SEND_ADDON_RESULT.AddOnMessageLockdown then
+      return false, result
+    end
+  end
+
+  return false, SEND_ADDON_RESULT.NotInGroup
+end
+
+local function QueuePendingComm(msg)
+  local tag = ExtractCommTag(msg)
+  if not tag then return false end
+  pendingComm[tag] = msg
+  ScheduleCommRetry(math.max(0.10, commBackoffUntil - Now()))
+  return true
+end
+
+local function FlushPendingComm()
+  if IsCombatSyncBlocked() then
+    if not waitingForRegen then
+      waitingForRegen = true
+      f:RegisterEvent("PLAYER_REGEN_ENABLED")
+    end
+    return false
+  end
+
+  if Now() < commBackoffUntil then return false end
+
+  local order = { "P", "C", "S", "HELLO", "REQ" }
+  for i = 1, #order do
+    local tag = order[i]
+    local msg = pendingComm[tag]
+    if msg then
+      local ok, result = SendCommNow(msg)
+      if ok then
+        pendingComm[tag] = nil
+      elseif result == SEND_ADDON_RESULT.AddonMessageThrottle or result == SEND_ADDON_RESULT.ChannelThrottle or result == SEND_ADDON_RESULT.AddOnMessageLockdown then
+        commBackoffUntil = Now() + ((tag == "P" or tag == "C") and 0.75 or 1.25)
+        ScheduleCommRetry(commBackoffUntil - Now())
+        return false
+      else
+        pendingComm[tag] = nil
+      end
+    end
+  end
+
+  if HasPendingComm() then
+    ScheduleCommRetry(0.75)
+    return false
+  end
+
+  CancelCommRetry()
+  return true
+end
+
+local function SendComm(msg)
+  if IsCombatSyncBlocked() then
+    QueuePendingComm(msg)
+    if not waitingForRegen then
+      waitingForRegen = true
+      f:RegisterEvent("PLAYER_REGEN_ENABLED")
+    end
+    return false
+  end
+
+  if Now() < commBackoffUntil then
+    QueuePendingComm(msg)
+    return false
+  end
+
+  local ok, result = SendCommNow(msg)
+  if ok then
+    return true
+  end
+
+  if result == SEND_ADDON_RESULT.AddonMessageThrottle or result == SEND_ADDON_RESULT.ChannelThrottle or result == SEND_ADDON_RESULT.AddOnMessageLockdown then
+    commBackoffUntil = Now() + 1.25
+    QueuePendingComm(msg)
+    return false
+  end
+
+  return false
+end
+
+local function SendHello()
+  if phase == "idle" then return end
+  if Throttled("hello", 2.0) then return end
+  SendComm(string.format("HELLO:%d:%s", encounterID, myClass or ""))
+end
+
+local function SendRequest()
+  if phase == "idle" then return end
+  if Throttled("req", 1.5) then return end
+  SendComm(string.format("REQ:%d", encounterID))
+end
+
+local function SendState()
+  if phase == "idle" then return end
+  if myJumps <= 0 then return end
+  SendComm(string.format("S:%d:%d:%s", encounterID, myJumps, myClass or ""))
+end
+
+local function BroadcastUpdate(force)
+  if phase ~= "active" then return end
+  if myJumps <= 0 then return end
+
+  local t = Now()
+  if not force then
+    if (t - lastBroadcastAt) < (db.broadcastInterval or DEFAULTS.broadcastInterval) then
+      pendingBroadcast = true
+      return
+    end
+  end
+
+  pendingBroadcast = false
+  lastBroadcastAt = t
+  SendState()
+end
+
+local function Heartbeat()
+  if phase ~= "active" then return end
+  local t = Now()
+  if (t - lastHeartbeatAt) < (db.heartbeatInterval or DEFAULTS.heartbeatInterval) then return end
+  lastHeartbeatAt = t
+  SendHello()
+  SendState()
+end
+
+local function ReqPulse()
+  if phase ~= "active" then return end
+  local t = Now()
+  local interval = db.reqPulseInterval or DEFAULTS.reqPulseInterval
+  if (t - lastReqPulseAt) < interval then return end
+  lastReqPulseAt = t
+  SendRequest()
+end
+
+-- End burst sync: extra STATE/REQ after encounter end to help everyone converge
+local function EndBurstTick()
+  if phase ~= "ended" then return end
+  local t = Now()
+  if t > endBurstUntil then return end
+
+  local stateEvery = db.endBurstStateEvery or DEFAULTS.endBurstStateEvery
+  local reqEvery = db.endBurstReqEvery or DEFAULTS.endBurstReqEvery
+
+  if myJumps > 0 and (t - lastEndBurstStateAt) >= stateEvery then
+    lastEndBurstStateAt = t
+    SendState()
+  end
+
+  if (t - lastEndBurstReqAt) >= reqEvery then
+    lastEndBurstReqAt = t
+    -- pull any missed states
+    SendRequest()
+  end
+end
+
+-- Claims / Posted lock
+local function SendClaim(winnerFull, winnerCount)
+  SendComm(string.format("C:%d:%s:%d", encounterID, winnerFull or "", tonumber(winnerCount or 0) or 0))
+end
+
+local function SendPosted(posterFull)
+  SendComm(string.format("P:%d:%s", encounterID, posterFull or ""))
+end
+
+local function SendPostedBurst(posterFull)
+  -- send 3 times (spaced) to reduce "missed P" multi-posts
+  SendPosted(posterFull)
+  C_Timer.After(0.20, function() SendPosted(posterFull) end)
+  C_Timer.After(0.45, function() SendPosted(posterFull) end)
+end
+
+local function SendClaimBurst(winnerFull, winnerCount)
+  SendClaim(winnerFull, winnerCount)
+  C_Timer.After(0.25, function() SendClaim(winnerFull, winnerCount) end)
+end
+
+-- -----------------------------
+-- Chat safety
+-- -----------------------------
+local function SanitizeForChat(s)
+  if type(s) ~= "string" then return "" end
+  return s:gsub("|", "||")
+end
+
+local function IsChatSendSafe()
+  local hasCAPI = (C_ChatInfo and type(C_ChatInfo.SendChatMessage) == "function")
+  if not hasCAPI then return false end
+  if chatPostingBlocked then return false end
+  if phase == "active" then return false end
+
+  -- If chat send paths are tainted by another addon, do not attempt a protected send.
+  if type(issecurevariable) == "function" then
+    local secureGlobal = issecurevariable("SendChatMessage")
+    local secureCAPI = issecurevariable(C_ChatInfo, "SendChatMessage")
+    if secureGlobal ~= true or secureCAPI ~= true then
+      return false
+    end
+  end
+
+  if (InCombatLockdown and InCombatLockdown()) or (UnitAffectingCombat and UnitAffectingCombat("player")) then
+    return false
+  end
+
+  -- Avoid a same-frame/tiny-window race right after combat ends.
+  if lastRegenAt > 0 and (Now() - lastRegenAt) < 0.30 then
+    return false
+  end
+
+  return true
+end
+
+local function TrySendChatLine(msg, chatType)
+  msg = SanitizeForChat(msg)
+  if msg == "" then return true end
+  if not IsChatSendSafe() then return false end
+
+  if C_ChatInfo and type(C_ChatInfo.SendChatMessage) == "function" then
+    local ok = pcall(C_ChatInfo.SendChatMessage, msg, chatType)
+    if ok then return true end
+  end
+
+  return false
+end
+
+local function TryFlushChatQueue()
+  if not pendingChatLines or #pendingChatLines == 0 then
+    pendingChatLines = nil
+    pendingChatNextIndex = 1
+    return true
+  end
+
+  local lines = pendingChatLines
+
+  if not IsChatSendSafe() then return false end
+
+  local ch = GetGroupChannel()
+  if not ch then return false end
+
+  local startIndex = pendingChatNextIndex or 1
+  for i = startIndex, #lines do
+    -- Another handler may clear/replace the queue while we are flushing.
+    if pendingChatLines ~= lines then
+      return false
+    end
+
+    local ok = TrySendChatLine(lines[i], ch)
+    if not ok then
+      pendingChatNextIndex = i
+      return false
+    end
+    pendingChatNextIndex = i + 1
+  end
+
+  if pendingChatLines == lines then
+    pendingChatLines = nil
+    pendingChatNextIndex = 1
+  end
+  return true
+end
+
+local function ScheduleChatRetry()
+  CancelChatRetry()
+  chatRetryTimer = C_Timer.NewTimer(0.80, function()
+    chatRetryTimer = nil
+    if pendingChatLines then
+      if not IsChatSendSafe() then
+        ScheduleChatRetry()
+        return
+      end
+
+      local ok = TryFlushChatQueue()
+      if not ok then
+        -- keep retrying until safe
+        ScheduleChatRetry()
+      end
+    end
+  end)
+end
+
+local function QueueChatPost(lines)
+  if not lines or #lines == 0 then return end
+  if phase == "active" then return end
+  pendingChatLines = lines
+  pendingChatNextIndex = 1
+
+  if not IsChatSendSafe() then
+    if not waitingForRegen then
+      waitingForRegen = true
+      f:RegisterEvent("PLAYER_REGEN_ENABLED")
+    end
+    ScheduleChatRetry()
+    return
+  end
+
+  -- IMPORTANT: never send immediately from ENCOUNTER_END stack; always defer a tick.
+  C_Timer.After(0.10, function()
+    if not pendingChatLines then return end
+    local ok = TryFlushChatQueue()
+    if not ok then
+      -- Will retry (and also on regen if needed)
+      ScheduleChatRetry()
+      if InCombatLockdown and InCombatLockdown() and not waitingForRegen then
+        waitingForRegen = true
+        f:RegisterEvent("PLAYER_REGEN_ENABLED")
+      end
+    end
+  end)
+end
+
+-- -----------------------------
+-- Jump detection
+-- -----------------------------
+local function OnJumpDetected()
+  if phase ~= "active" then return end
+  if UnitInVehicle("player") or UnitOnTaxi("player") then return end
+
+  local t = Now()
+  if (t - lastJumpAt) < 0.20 then return end
+  lastJumpAt = t
+
+  myJumps = myJumps + 1
+  if myJumps == 1 then jumped[myName] = true end
+
+  totals[myName] = myJumps
+  lastSeen[myName] = t
+  classByName[myName] = myClass
+
+  BroadcastUpdate(false)
+  UpdateUI()
+end
+
+hooksecurefunc("JumpOrAscendStart", function()
+  OnJumpDetected()
+end)
+
+-- -----------------------------
+-- Posting helpers
+-- -----------------------------
+local function BuildSortedTotalsAll()
+  local arr = {}
+  for name, count in pairs(totals) do
+    if type(count) == "number" and count > 0 then
+      table.insert(arr, { name = name, count = count, short = ShortName(name) })
+    end
+  end
+  table.sort(arr, function(a, b)
+    if a.count ~= b.count then return a.count > b.count end
+    return a.name < b.name
+  end)
+  return arr
+end
+
+local function DetermineLocalWinner()
+  local arr = BuildSortedTotalsAll()
+  if #arr == 0 then return nil, 0 end
+  return arr[1].name, arr[1].count or 0
+end
+
+local function JumpWord(n)
+  return (n == 1) and "Jump!" or "Jumps!"
+end
+
+local function BuildChatLines()
+  local arr = BuildSortedTotalsAll()
+  local total = #arr
+  if total == 0 then return nil end
+
+  local boss = (encounterName ~= "" and encounterName) or "Boss"
+  local suffix = ""
+  if encounterSuccess ~= nil then
+    suffix = encounterSuccess and " (Kill)" or " (Wipe)"
+  end
+
+  local lines = {}
+  table.insert(lines, string.format("Jump Leaderboard - %s%s", boss, suffix))
+
+  local configured = tonumber(db.postTopN or DEFAULTS.postTopN or 5) or 5
+  if configured < 5 then configured = 5 end
+  local topN = math.min(configured, total)
+
+  for i = 1, topN do
+    local row = arr[i]
+    table.insert(lines, string.format("%d) %s - %d %s", i, row.short, row.count, JumpWord(row.count)))
+  end
+
+  return lines
+end
+
+local function DeterministicDelaySeconds(key)
+  local sum = 0
+  for i = 1, #key do
+    sum = (sum + string.byte(key, i)) % 1000
+  end
+  return 0.45 + ((sum % 650) / 1000) -- 0.45 .. 1.10 (slightly wider)
+end
+
+local function ConsiderClaim(winnerFull, winnerCount)
+  winnerFull = winnerFull or ""
+  winnerCount = tonumber(winnerCount or 0) or 0
+  if winnerFull == "" or winnerCount <= 0 then return end
+
+  if not claimWinnerFull then
+    claimWinnerFull = winnerFull
+    claimWinnerCount = winnerCount
+    return
+  end
+
+  if winnerCount > (claimWinnerCount or 0) then
+    claimWinnerFull = winnerFull
+    claimWinnerCount = winnerCount
+  elseif winnerCount == (claimWinnerCount or 0) and winnerFull < claimWinnerFull then
+    claimWinnerFull = winnerFull
+    claimWinnerCount = winnerCount
+  end
+end
+
+local function FinalWinnerFull()
+  if claimWinnerFull and claimWinnerFull ~= "" and (claimWinnerCount or 0) > 0 then
+    return claimWinnerFull, claimWinnerCount
+  end
+  return DetermineLocalWinner()
+end
+
+local function HandleEncounterEndPosting()
+  local window = db.syncWindow or DEFAULTS.syncWindow
+  local gather = db.claimPostDelay or DEFAULTS.claimPostDelay
+
+  CancelPostTimer()
+  postedByFull = nil
+  claimWinnerFull = nil
+  claimWinnerCount = 0
+
+  -- Step 1: after window, broadcast our claim (burst) and apply it locally
+  C_Timer.After(window, function()
+    if postedByFull then return end
+
+    local localWinner, localCount = DetermineLocalWinner()
+    if not localWinner or localCount <= 0 then return end
+
+    SendClaimBurst(localWinner, localCount)
+    ConsiderClaim(localWinner, localCount)
+
+    -- Step 2: give claims time to arrive, then decide final
+    C_Timer.After(gather, function()
+      if postedByFull then return end
+
+      local winnerFull = select(1, FinalWinnerFull())
+      if not winnerFull or winnerFull == "" then return end
+      if winnerFull ~= myName then return end
+
+      local delay = DeterministicDelaySeconds(myName)
+      postTimer = C_Timer.NewTimer(delay, function()
+        postTimer = nil
+        if postedByFull then return end
+
+        local finalWinner = select(1, FinalWinnerFull())
+        if finalWinner ~= myName then return end
+
+        -- If still in combat, we can't get cross-player sync; defer winner commit to regen.
+        if IsCombatSyncBlocked() then
+          needsPostCombatArbiter = true
+          if not waitingForRegen then
+            waitingForRegen = true
+            f:RegisterEvent("PLAYER_REGEN_ENABLED")
+          end
+          return
+        end
+
+        -- Lock first (burst), then queue chat (deferred + retry)
+        postedByFull = myName
+        SendPostedBurst(myName)
+        QueueChatPost(BuildChatLines())
+      end)
+    end)
+  end)
+end
+
+-- -----------------------------
+-- Lifecycle
+-- -----------------------------
+local function BeginEncounter(newID, newName)
+  phase = "active"
+  encounterID = newID or 0
+  encounterName = newName or "Encounter"
+  encounterSuccess = nil
+  chatPostingBlocked = false
+
+  pendingComm = { HELLO = nil, REQ = nil, S = nil, C = nil, P = nil }
+  commBackoffUntil = 0
+  CancelCommRetry()
+
+  myJumps = 0
+
+  wipe(totals)
+  wipe(lastSeen)
+  wipe(classByName)
+  wipe(jumped)
+
+  lastBroadcastAt = 0
+  lastHeartbeatAt = 0
+  pendingBroadcast = false
+  lastReqPulseAt = 0
+
+  endBurstUntil = 0
+  lastEndBurstStateAt = 0
+  lastEndBurstReqAt = 0
+
+  claimWinnerFull = nil
+  claimWinnerCount = 0
+  postedByFull = nil
+  CancelPostTimer()
+
+  pendingChatLines = nil
+  pendingChatNextIndex = 1
+  needsPostCombatArbiter = false
+  waitingForRegen = false
+  lastRegenAt = 0
+  CancelChatRetry()
+  f:UnregisterEvent("PLAYER_REGEN_ENABLED")
+
+  SendHello()
+  SendRequest()
+  UpdateUI()
+end
+
+local function FreezeEncounter(encIDFromEvent, successFlag)
+  phase = "ended"
+  pendingBroadcast = false
+
+  if encounterID == 0 or encounterID ~= encIDFromEvent then
+    encounterID = encIDFromEvent or encounterID
+    if encounterName == "" then encounterName = "Encounter" end
+  end
+
+  encounterSuccess = (successFlag == 1) and true or ((successFlag == 0) and false or encounterSuccess)
+
+  -- Start end burst window (extra sync for convergence)
+  local burst = db.endBurstSeconds or DEFAULTS.endBurstSeconds
+  endBurstUntil = Now() + burst
+  lastEndBurstStateAt = 0
+  lastEndBurstReqAt = 0
+
+  -- Initial push + pull
+  SendState()
+  SendRequest()
+  UpdateUI()
+end
+
+local function EndEncounterUI()
+  phase = "idle"
+  CancelPostTimer()
+  pendingComm = { HELLO = nil, REQ = nil, S = nil, C = nil, P = nil }
+  commBackoffUntil = 0
+  CancelCommRetry()
+  UpdateUI()
+end
+
+-- -----------------------------
+-- Incoming messages
+-- -----------------------------
+local function NormalizeSender(sender)
+  sender = sender or ""
+  if sender ~= "" and not sender:find("-") then
+    local realm = GetRealmName() or ""
+    if realm ~= "" then sender = sender .. "-" .. realm end
+  end
+  return sender
+end
+
+local function OnAddonMessage(prefix, msg, channel, sender)
+  -- Blizzard Midnight (12.0): all addon comms are encrypted/unavailable during
+  -- combat inside instances. Discard incoming messages while in combat lockdown.
+  if IsCombatSyncBlocked() then return end
+  if prefix ~= PREFIX then return end
+  if type(msg) ~= "string" then return end
+
+  sender = NormalizeSender(sender)
+  if sender == "" then return end
+
+  local tag, a, b, c = msg:match("^(%u+):([^:]*):?([^:]*):?(.*)$")
+  if not tag then return end
+
+  if tag == "HELLO" then
+    local enc = tonumber(a) or 0
+    local classFile = b or ""
+    if phase == "idle" then return end
+    if enc ~= encounterID then return end
+    if classFile ~= "" then classByName[sender] = classFile end
+    SendState()
+    return
+  end
+
+  if tag == "REQ" then
+    local enc = tonumber(a) or 0
+    if phase == "idle" then return end
+    if enc ~= encounterID then return end
+    SendState()
+    return
+  end
+
+  if tag == "S" then
+    local enc = tonumber(a)
+    local count = tonumber(b)
+    local classFile = c or ""
+    if not enc or count == nil then return end
+    if phase == "idle" then return end
+    if enc ~= encounterID then return end
+
+    if count <= 0 then
+      if jumped[sender] then totals[sender] = nil end
+      if classFile ~= "" then classByName[sender] = classFile end
+      return
+    end
+
+    jumped[sender] = true
+    totals[sender] = count
+    lastSeen[sender] = Now()
+    if classFile ~= "" then classByName[sender] = classFile end
+    UpdateUI()
+    return
+  end
+
+  if tag == "C" then
+    local enc = tonumber(a)
+    local winnerFull = b
+    local winnerCount = tonumber(c)
+    if not enc or not winnerFull or winnerFull == "" or not winnerCount then return end
+    if enc ~= encounterID then return end
+
+    ConsiderClaim(winnerFull, winnerCount)
+    return
+  end
+
+  if tag == "P" then
+    local enc = tonumber(a)
+    local posterFull = b
+    if not enc or not posterFull or posterFull == "" then return end
+    if enc ~= encounterID then return end
+
+    -- Hard stop: someone posted; cancel any scheduled post and any pending chat.
+    postedByFull = posterFull
+    CancelPostTimer()
+    if posterFull ~= myName then
+      pendingChatLines = nil
+      pendingChatNextIndex = 1
+      CancelChatRetry()
+    end
+    return
+  end
+end
+
+-- -----------------------------
+-- Slash commands
+-- -----------------------------
+local function SlashHelp()
+  print("|cffffd100JumpBoss commands:|r")
+  print("/jb show | hide")
+  print("/jb lock | unlock")
+  print("/jb scale <n>")
+  print("/jb timeout <s>")
+  print("/jb fade <s>")
+  print("/jb top <n>  (min 5)")
+end
+
+SLASH_JUMPBOSS1 = "/jumpboss"
+SLASH_JUMPBOSS2 = "/jb"
+SlashCmdList.JUMPBOSS = function(msg)
+  msg = (msg or "")
+  local lower = msg:lower()
+
+  if lower == "show" then db.show = true; ui:Show(); UpdateUI(); return end
+  if lower == "hide" then db.show = false; ui:Hide(); return end
+  if lower == "lock" then db.locked = true; print("JumpBoss: frame locked."); return end
+  if lower == "unlock" then db.locked = false; print("JumpBoss: frame unlocked (drag to move)."); return end
+
+  local cmd, val = lower:match("^(%S+)%s*(.*)$")
+  if cmd == "scale" and val ~= "" then
+    local n = tonumber(val)
+    if n and n > 0.2 and n < 3.0 then db.scale = n; ApplyUISettings(); return end
+  elseif cmd == "timeout" and val ~= "" then
+    local n = tonumber(val)
+    if n and n >= 0.5 and n <= 300 then db.staleTimeout = n; return end
+  elseif cmd == "fade" and val ~= "" then
+    local n = tonumber(val)
+    if n and n >= 0.2 and n <= 60 then db.fadeDuration = n; return end
+  elseif cmd == "top" and val ~= "" then
+    local n = tonumber(val)
+    if n and n >= 5 and n <= 50 then db.postTopN = math.floor(n); return end
+  end
+
+  SlashHelp()
+end
+
+-- -----------------------------
+-- Events
+-- -----------------------------
+f:SetScript("OnEvent", function(self, event, ...)
+  if event == "ADDON_LOADED" then
+    local name = ...
+    if name ~= ADDON_NAME then return end
+
+    myName = PlayerFullName()
+    myShort = ShortName(myName)
+    local _, classFile = UnitClass("player")
+    myClass = classFile or ""
+
+    JumpBossDB = JumpBossDB or {}
+    db = JumpBossDB
+    CopyDefaults(db, DEFAULTS)
+
+    if type(db.postTopN) == "number" and db.postTopN < 5 then
+      db.postTopN = 5
+    end
+
+    RegisterPrefix(PREFIX)
+    ApplyUISettings()
+    UpdateUI()
+    return
+  end
+
+  if event == "PLAYER_REGEN_ENABLED" then
+    lastRegenAt = Now()
+
+    -- If encounter ended while in combat, reset the end-burst window now so
+    -- the first available post-combat tick triggers a full convergence sync.
+    if phase == "ended" then
+      local burst = db.endBurstSeconds or DEFAULTS.endBurstSeconds
+      endBurstUntil = Now() + burst
+      lastEndBurstStateAt = 0
+      lastEndBurstReqAt = 0
+    end
+
+    -- If the post timer fired during combat and deferred, re-evaluate winner now.
+    if needsPostCombatArbiter and phase == "ended" and not postedByFull then
+      needsPostCombatArbiter = false
+      local gather = db.claimPostDelay or DEFAULTS.claimPostDelay
+      -- Brief settle so end-burst STATE/CLAIM messages have time to propagate.
+      C_Timer.After(0.80, function()
+        if phase ~= "ended" or postedByFull then return end
+        local winnerFull = select(1, FinalWinnerFull())
+        if not winnerFull or winnerFull ~= myName then return end
+        local delay = DeterministicDelaySeconds(myName)
+        postTimer = C_Timer.NewTimer(delay, function()
+          postTimer = nil
+          if postedByFull then return end
+          local finalWinner = select(1, FinalWinnerFull())
+          if finalWinner ~= myName then return end
+          postedByFull = myName
+          SendPostedBurst(myName)
+          QueueChatPost(BuildChatLines())
+        end)
+      end)
+    end
+
+    if pendingChatLines then
+      -- Give the client a brief settle window after leaving combat.
+      C_Timer.After(0.30, function()
+        if not pendingChatLines then return end
+        local ok = TryFlushChatQueue()
+        if not ok then
+          ScheduleChatRetry()
+        end
+      end)
+    end
+
+    if HasPendingComm() then
+      local ok = FlushPendingComm()
+      if not ok and HasPendingComm() then
+        ScheduleCommRetry(0.60)
+      end
+    end
+
+    if not pendingChatLines and not HasPendingComm() then
+      waitingForRegen = false
+      f:UnregisterEvent("PLAYER_REGEN_ENABLED")
+    end
+    return
+  end
+
+  if event == "CHAT_MSG_ADDON" then
+    local pfx, msg, ch, sender = ...
+    OnAddonMessage(pfx, msg, ch, sender)
+    return
+  end
+
+  if event == "ADDON_ACTION_FORBIDDEN" or event == "ADDON_ACTION_BLOCKED" then
+    local addonName, addonFunc = ...
+    if addonName == ADDON_NAME then
+      chatPostingBlocked = true
+      pendingChatLines = nil
+      pendingChatNextIndex = 1
+      waitingForRegen = false
+      CancelChatRetry()
+      f:UnregisterEvent("PLAYER_REGEN_ENABLED")
+      if type(addonFunc) == "string" and addonFunc ~= "" then
+        print(string.format("JumpBoss: auto leaderboard posting blocked by protected UI state this session (%s).", addonFunc))
+      else
+        print("JumpBoss: auto leaderboard posting blocked by protected UI state this session.")
+      end
+    end
+    return
+  end
+
+  if event == "ENCOUNTER_START" then
+    local encID, encName = ...
+    BeginEncounter(encID, encName)
+    return
+  end
+
+  if event == "PLAYER_JUMP" then
+    OnJumpDetected()
+    return
+  end
+
+  if event == "ENCOUNTER_END" then
+    local encID, encName, difficultyID, groupSize, success = ...
+    if phase ~= "idle" then
+      FreezeEncounter(encID, success)
+      HandleEncounterEndPosting()
+      C_Timer.After(db.postVisibleSeconds or DEFAULTS.postVisibleSeconds, EndEncounterUI)
+    end
+    return
+  end
+
+  if event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
+    if phase ~= "idle" then
+      SendHello()
+      SendRequest()
+    end
+    return
+  end
+end)
+
+f:RegisterEvent("ADDON_LOADED")
+f:RegisterEvent("CHAT_MSG_ADDON")
+f:RegisterEvent("ADDON_ACTION_FORBIDDEN")
+f:RegisterEvent("ADDON_ACTION_BLOCKED")
+f:RegisterEvent("ENCOUNTER_START")
+f:RegisterEvent("ENCOUNTER_END")
+-- Register PLAYER_JUMP when the client supports it; fallback hook above remains active.
+pcall(function()
+  f:RegisterEvent("PLAYER_JUMP")
+end)
+f:RegisterEvent("GROUP_ROSTER_UPDATE")
+f:RegisterEvent("PLAYER_ENTERING_WORLD")
+
+f:SetScript("OnUpdate", function(self, elapsed)
+  if HasPendingComm() and not commRetryTimer and Now() >= commBackoffUntil then
+    FlushPendingComm()
+  end
+
+  if phase == "idle" then return end
+
+  if phase == "active" then
+    if pendingBroadcast then
+      BroadcastUpdate(false)
+    end
+    Heartbeat()
+    ReqPulse()
+  elseif phase == "ended" then
+    EndBurstTick()
+  end
+
+  UpdateUI()
+end)
