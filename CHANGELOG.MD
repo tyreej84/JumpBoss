@@ -4,6 +4,15 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.4.4 - 2026-05-14
+### Fixed
+- Hardened post-encounter leaderboard chat send path after fresh BugGrabber findings:
+  - Removed `securecallfunction(C_ChatInfo.SendChatMessage, ...)` send wrapper from queue flush attempts.
+  - Chat sends now call `C_ChatInfo.SendChatMessage` directly through `pcall`, avoiding the protected-call `UNKNOWN()` path seen in `ADDON_ACTION_BLOCKED` stacks.
+
+### Notes
+- Existing session safety remains unchanged: any `ADDON_ACTION_FORBIDDEN` or `ADDON_ACTION_BLOCKED` attributed to JumpBoss still disables auto leaderboard posting for the current session.
+
 ## 1.4.3 - 2026-05-05
 ### Fixed
 - Hardened protected-action fallback for chat posting safety:

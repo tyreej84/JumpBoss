@@ -645,8 +645,8 @@ local function TrySendChatLine(msg, chatType)
   if msg == "" then return true end
   if not IsChatSendSafe() then return false end
 
-  if C_ChatInfo and type(C_ChatInfo.SendChatMessage) == "function" and type(securecallfunction) == "function" then
-    local ok = pcall(securecallfunction, C_ChatInfo.SendChatMessage, msg, chatType)
+  if C_ChatInfo and type(C_ChatInfo.SendChatMessage) == "function" then
+    local ok = pcall(C_ChatInfo.SendChatMessage, msg, chatType)
     if ok then return true end
   end
 
