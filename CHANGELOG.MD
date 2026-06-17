@@ -4,6 +4,33 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.4.7 - 2026-06-17
+### Changed
+- Restored automatic group-chat leaderboard posting as the default behavior.
+- Kept `/jb autopost on|off` so posting can still be disabled from saved settings if protected chat sends are blocked in a session.
+
+### Packaging
+- Bumped addon version to `1.4.7`.
+
+## 1.4.6 - 2026-06-17
+### Fixed
+- Disabled automatic group-chat leaderboard posting by default to prevent `ADDON_ACTION_BLOCKED` / `UNKNOWN()` protected-call captures from the post-encounter send path.
+- When auto-post is off, the winner still prints the leaderboard locally so the result is preserved without touching the protected chat-send API.
+
+### Added
+- Added `/jb autopost on|off` for manually opting back into automatic group-chat posting.
+
+### Packaging
+- Bumped addon version to `1.4.6`.
+
+## 1.4.5 - 2026-06-17
+### Changed
+- Updated Interface version to 120007 for Patch 12.0.7 compatibility.
+- Reviewed current encounter, chat, and addon-message API usage for 12.0.7 readiness.
+
+### Packaging
+- Bumped addon version to `1.4.5`.
+
 ## 1.4.4 - 2026-05-14
 ### Fixed
 - Hardened post-encounter leaderboard chat send path after fresh BugGrabber findings:

@@ -1,5 +1,5 @@
 -- JumpBoss.lua
--- v1.4.1
+-- v1.4.7
 --
 -- Fixes / Improvements:
 --  - FIX: Multi-poster issues hardened:
@@ -57,6 +57,7 @@ local DEFAULTS = {
   endBurstReqEvery = 1.40,    -- NEW: REQ interval during burst
 
   postTopN = 5, -- min 5 enforced
+  autoPostChat = true,
 
   pos = { point = "CENTER", relPoint = "CENTER", x = 0, y = 160 },
 }
@@ -711,6 +712,13 @@ end
 local function QueueChatPost(lines)
   if not lines or #lines == 0 then return end
   if phase == "active" then return end
+  if not (db and db.autoPostChat == true) then
+    print("|cffffd100JumpBoss:|r Auto-post is off; leaderboard:")
+    for i = 1, #lines do
+      print("|cffffd100JumpBoss:|r " .. SanitizeForChat(lines[i]))
+    end
+    return
+  end
   pendingChatLines = lines
   pendingChatNextIndex = 1
 
@@ -1091,6 +1099,7 @@ local function SlashHelp()
   print("/jb timeout <s>")
   print("/jb fade <s>")
   print("/jb top <n>  (min 5)")
+  print("/jb autopost on|off")
 end
 
 SLASH_JUMPBOSS1 = "/jumpboss"
@@ -1117,6 +1126,19 @@ SlashCmdList.JUMPBOSS = function(msg)
   elseif cmd == "top" and val ~= "" then
     local n = tonumber(val)
     if n and n >= 5 and n <= 50 then db.postTopN = math.floor(n); return end
+  elseif cmd == "autopost" and val ~= "" then
+    if val == "on" then
+      db.autoPostChat = true
+      print("JumpBoss: automatic group-chat leaderboard posting enabled.")
+      return
+    elseif val == "off" then
+      db.autoPostChat = false
+      pendingChatLines = nil
+      pendingChatNextIndex = 1
+      CancelChatRetry()
+      print("JumpBoss: automatic group-chat leaderboard posting disabled.")
+      return
+    end
   end
 
   SlashHelp()
