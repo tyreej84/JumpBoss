@@ -1,5 +1,5 @@
 -- JumpBoss.lua
--- v1.4.7
+-- v1.4.8
 --
 -- Fixes / Improvements:
 --  - FIX: Multi-poster issues hardened:
@@ -9,7 +9,7 @@
 --  - FIX: ADDON_ACTION_FORBIDDEN / UNKNOWN():
 --      * Never posts chat in ENCOUNTER_END call stack (always deferred)
 --      * Chat posting is queued + retries (combat-safe + taint-safe-ish)
---  - FIX: Handles ADDON_ACTION_BLOCKED same as ADDON_ACTION_FORBIDDEN for safe chat-post disable
+--  - FIX: Handles ADDON_ACTION_BLOCKED with a longer retry cooldown instead of dropping results
 --  - Live updates: debounced JumpOrAscendStart hook + periodic REQ pulse during encounter
 --  - Posting: posts on BOTH wipes and kills (ENCOUNTER_END), winner-only
 --  - Posting: claim arbitration uses FULL names for deterministic tie-break
@@ -50,6 +50,7 @@ local DEFAULTS = {
   syncWindow = 5.0,           -- time to let STATE/claims settle before selecting winner
   claimPostDelay = 0.75,      -- additional settle time after sending claim
   postVisibleSeconds = 20.0,
+  postCombatChatDelay = 5.0,
 
   reqPulseInterval = 8.0,     -- periodic REQ during encounter
   endBurstSeconds = 2.0,      -- NEW: burst sync after ENCOUNTER_END
@@ -180,7 +181,7 @@ local pendingChatNextIndex = 1
 local waitingForRegen = false
 local chatRetryTimer = nil
 local lastRegenAt = 0
-local chatPostingBlocked = false
+local chatPostBlockedUntil = 0
 
 local lastJumpAt = 0
 
@@ -617,7 +618,7 @@ end
 local function IsChatSendSafe()
   local hasCAPI = (C_ChatInfo and type(C_ChatInfo.SendChatMessage) == "function")
   if not hasCAPI then return false end
-  if chatPostingBlocked then return false end
+  if chatPostBlockedUntil > 0 and Now() < chatPostBlockedUntil then return false end
   if phase == "active" then return false end
 
   -- If chat send paths are tainted by another addon, do not attempt a protected send.
@@ -633,8 +634,10 @@ local function IsChatSendSafe()
     return false
   end
 
-  -- Avoid a same-frame/tiny-window race right after combat ends.
-  if lastRegenAt > 0 and (Now() - lastRegenAt) < 0.30 then
+  -- Avoid the taint-sensitive window right after combat ends.
+  local settleDelay = tonumber(db and db.postCombatChatDelay) or DEFAULTS.postCombatChatDelay
+  if settleDelay < 0.80 then settleDelay = 0.80 end
+  if lastRegenAt > 0 and (Now() - lastRegenAt) < settleDelay then
     return false
   end
 
@@ -690,9 +693,11 @@ local function TryFlushChatQueue()
   return true
 end
 
-local function ScheduleChatRetry()
+local function ScheduleChatRetry(delaySeconds)
   CancelChatRetry()
-  chatRetryTimer = C_Timer.NewTimer(0.80, function()
+  local delay = tonumber(delaySeconds) or 0.80
+  if delay < 0.80 then delay = 0.80 end
+  chatRetryTimer = C_Timer.NewTimer(delay, function()
     chatRetryTimer = nil
     if pendingChatLines then
       if not IsChatSendSafe() then
@@ -731,8 +736,11 @@ local function QueueChatPost(lines)
     return
   end
 
-  -- IMPORTANT: never send immediately from ENCOUNTER_END stack; always defer a tick.
-  C_Timer.After(0.10, function()
+  -- IMPORTANT: never send immediately from ENCOUNTER_END/regen stacks; wait for
+  -- the post-combat UI state to settle before touching protected chat APIs.
+  local postDelay = tonumber(db and db.postCombatChatDelay) or DEFAULTS.postCombatChatDelay
+  if postDelay < 0.80 then postDelay = 0.80 end
+  C_Timer.After(postDelay, function()
     if not pendingChatLines then return end
     local ok = TryFlushChatQueue()
     if not ok then
@@ -922,7 +930,7 @@ local function BeginEncounter(newID, newName)
   encounterID = newID or 0
   encounterName = newName or "Encounter"
   encounterSuccess = nil
-  chatPostingBlocked = false
+  chatPostBlockedUntil = 0
 
   pendingComm = { HELLO = nil, REQ = nil, S = nil, C = nil, P = nil }
   commBackoffUntil = 0
@@ -1099,6 +1107,7 @@ local function SlashHelp()
   print("/jb timeout <s>")
   print("/jb fade <s>")
   print("/jb top <n>  (min 5)")
+  print("/jb postdelay <s>")
   print("/jb autopost on|off")
 end
 
@@ -1126,6 +1135,13 @@ SlashCmdList.JUMPBOSS = function(msg)
   elseif cmd == "top" and val ~= "" then
     local n = tonumber(val)
     if n and n >= 5 and n <= 50 then db.postTopN = math.floor(n); return end
+  elseif cmd == "postdelay" and val ~= "" then
+    local n = tonumber(val)
+    if n and n >= 0.8 and n <= 30 then
+      db.postCombatChatDelay = n
+      print(string.format("JumpBoss: leaderboard post delay set to %.1f seconds.", n))
+      return
+    end
   elseif cmd == "autopost" and val ~= "" then
     if val == "on" then
       db.autoPostChat = true
@@ -1164,6 +1180,11 @@ f:SetScript("OnEvent", function(self, event, ...)
     if type(db.postTopN) == "number" and db.postTopN < 5 then
       db.postTopN = 5
     end
+    if type(db.postCombatChatDelay) ~= "number" or db.postCombatChatDelay < 0.8 then
+      db.postCombatChatDelay = DEFAULTS.postCombatChatDelay
+    elseif db.postCombatChatDelay > 30 then
+      db.postCombatChatDelay = 30
+    end
 
     RegisterPrefix(PREFIX)
     ApplyUISettings()
@@ -1188,7 +1209,9 @@ f:SetScript("OnEvent", function(self, event, ...)
       needsPostCombatArbiter = false
       local gather = db.claimPostDelay or DEFAULTS.claimPostDelay
       -- Brief settle so end-burst STATE/CLAIM messages have time to propagate.
-      C_Timer.After(0.80, function()
+      local postDelay = tonumber(db and db.postCombatChatDelay) or DEFAULTS.postCombatChatDelay
+      if postDelay < 0.80 then postDelay = 0.80 end
+      C_Timer.After(postDelay, function()
         if phase ~= "ended" or postedByFull then return end
         local winnerFull = select(1, FinalWinnerFull())
         if not winnerFull or winnerFull ~= myName then return end
@@ -1207,7 +1230,9 @@ f:SetScript("OnEvent", function(self, event, ...)
 
     if pendingChatLines then
       -- Give the client a brief settle window after leaving combat.
-      C_Timer.After(0.30, function()
+      local postDelay = tonumber(db and db.postCombatChatDelay) or DEFAULTS.postCombatChatDelay
+      if postDelay < 0.80 then postDelay = 0.80 end
+      C_Timer.After(postDelay, function()
         if not pendingChatLines then return end
         local ok = TryFlushChatQueue()
         if not ok then
@@ -1239,16 +1264,16 @@ f:SetScript("OnEvent", function(self, event, ...)
   if event == "ADDON_ACTION_FORBIDDEN" or event == "ADDON_ACTION_BLOCKED" then
     local addonName, addonFunc = ...
     if addonName == ADDON_NAME then
-      chatPostingBlocked = true
-      pendingChatLines = nil
-      pendingChatNextIndex = 1
-      waitingForRegen = false
-      CancelChatRetry()
-      f:UnregisterEvent("PLAYER_REGEN_ENABLED")
+      local postDelay = tonumber(db and db.postCombatChatDelay) or DEFAULTS.postCombatChatDelay
+      if postDelay < 0.80 then postDelay = 0.80 end
+      chatPostBlockedUntil = Now() + math.max(8.0, postDelay * 2)
+      if pendingChatLines then
+        ScheduleChatRetry(chatPostBlockedUntil - Now())
+      end
       if type(addonFunc) == "string" and addonFunc ~= "" then
-        print(string.format("JumpBoss: auto leaderboard posting blocked by protected UI state this session (%s).", addonFunc))
+        print(string.format("JumpBoss: leaderboard posting hit protected UI state; retrying shortly (%s).", addonFunc))
       else
-        print("JumpBoss: auto leaderboard posting blocked by protected UI state this session.")
+        print("JumpBoss: leaderboard posting hit protected UI state; retrying shortly.")
       end
     end
     return

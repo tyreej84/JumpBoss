@@ -4,6 +4,23 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.4.9 - 2026-08-10
+### Changed
+- Updated Interface version to 120100 for Patch 12.1.0 compatibility.
+- Reviewed current encounter, chat, and addon-message API usage for 12.1.0 readiness.
+
+### Packaging
+- Bumped addon version to `1.4.9`.
+
+## 1.4.8 - 2026-06-18
+### Fixed
+- Kept automatic group-chat leaderboard posting enabled by default, but moved the first chat send farther into the post-combat window to avoid the protected `C_ChatInfo.SendChatMessage` timing captured by BugGrabber.
+- `ADDON_ACTION_BLOCKED` / `ADDON_ACTION_FORBIDDEN` from the chat send path now preserves the queued leaderboard and retries after a cooldown instead of abandoning posting for the session.
+- Added `/jb postdelay <s>` to tune the post-combat chat delay without another code change.
+
+### Packaging
+- Bumped addon version to `1.4.8`.
+
 ## 1.4.7 - 2026-06-17
 ### Changed
 - Restored automatic group-chat leaderboard posting as the default behavior.
