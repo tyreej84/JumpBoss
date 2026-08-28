@@ -25,6 +25,7 @@
 
 local ADDON_NAME = ...
 local PREFIX = "JBT1"
+local SendChatMessage = SendChatMessage
 
 local f = CreateFrame("Frame")
 local db
@@ -616,19 +617,9 @@ local function SanitizeForChat(s)
 end
 
 local function IsChatSendSafe()
-  local hasCAPI = (C_ChatInfo and type(C_ChatInfo.SendChatMessage) == "function")
-  if not hasCAPI then return false end
+  if type(SendChatMessage) ~= "function" then return false end
   if chatPostBlockedUntil > 0 and Now() < chatPostBlockedUntil then return false end
   if phase == "active" then return false end
-
-  -- If chat send paths are tainted by another addon, do not attempt a protected send.
-  if type(issecurevariable) == "function" then
-    local secureGlobal = issecurevariable("SendChatMessage")
-    local secureCAPI = issecurevariable(C_ChatInfo, "SendChatMessage")
-    if secureGlobal ~= true or secureCAPI ~= true then
-      return false
-    end
-  end
 
   if (InCombatLockdown and InCombatLockdown()) or (UnitAffectingCombat and UnitAffectingCombat("player")) then
     return false
@@ -649,9 +640,9 @@ local function TrySendChatLine(msg, chatType)
   if msg == "" then return true end
   if not IsChatSendSafe() then return false end
 
-  if C_ChatInfo and type(C_ChatInfo.SendChatMessage) == "function" then
-    local ok = pcall(C_ChatInfo.SendChatMessage, msg, chatType)
-    if ok then return true end
+  if type(SendChatMessage) == "function" then
+    SendChatMessage(msg, chatType)
+    return true
   end
 
   return false

@@ -4,6 +4,13 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.5.0 - 2026-08-28
+### Fixed
+- Localized the chat-send function at file load and invoke it directly from the existing post-combat queue, avoiding the protected `UNKNOWN()` call path captured by BugGrabber.
+
+### Packaging
+- Bumped addon version to `1.5.0`.
+
 ## 1.4.9 - 2026-08-10
 ### Changed
 - Updated Interface version to 120100 for Patch 12.1.0 compatibility.
