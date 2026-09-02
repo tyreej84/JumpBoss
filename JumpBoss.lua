@@ -25,7 +25,9 @@
 
 local ADDON_NAME = ...
 local PREFIX = "JBT1"
-local SendChatMessage = SendChatMessage
+-- Bind the current chat API directly. The legacy global routes through
+-- Blizzard_DeprecatedChatInfo and can produce ADDON_ACTION_BLOCKED.
+local SendChatMessage = C_ChatInfo and C_ChatInfo.SendChatMessage
 
 local f = CreateFrame("Frame")
 local db

@@ -4,6 +4,13 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.5.1 - 2026-09-02
+### Fixed
+- Switched post-combat chat output to the current chat API, avoiding the deprecated global chat route while retaining the existing combat queue.
+
+### Packaging
+- Bumped addon version to `1.5.1`.
+
 ## 1.5.0 - 2026-08-28
 ### Fixed
 - Localized the chat-send function at file load and invoke it directly from the existing post-combat queue, avoiding the protected `UNKNOWN()` call path captured by BugGrabber.
