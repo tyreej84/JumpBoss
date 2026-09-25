@@ -623,6 +623,15 @@ local function IsChatSendSafe()
   if chatPostBlockedUntil > 0 and Now() < chatPostBlockedUntil then return false end
   if phase == "active" then return false end
 
+  -- Chat lockdown can outlast personal combat (encounters, keys, and PvP).
+  -- Read the state so Activating is also blocked during restriction events.
+  if C_RestrictedActions and C_RestrictedActions.GetAddOnRestrictionState
+      and Enum and Enum.AddOnRestrictionType and Enum.AddOnRestrictionType.Chat
+      and Enum.AddOnRestrictionState then
+    if C_RestrictedActions.GetAddOnRestrictionState(Enum.AddOnRestrictionType.Chat)
+        ~= Enum.AddOnRestrictionState.Inactive then return false end
+  end
+
   if (InCombatLockdown and InCombatLockdown()) or (UnitAffectingCombat and UnitAffectingCombat("player")) then
     return false
   end
@@ -644,6 +653,9 @@ local function TrySendChatLine(msg, chatType)
 
   if type(SendChatMessage) == "function" then
     SendChatMessage(msg, chatType)
+    -- A blocked call may signal an event and return normally. Do not consume
+    -- this queue entry when our blocked-action handler marked it for retry.
+    if chatPostBlockedUntil > Now() then return false end
     return true
   end
 

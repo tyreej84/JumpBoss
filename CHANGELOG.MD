@@ -4,6 +4,15 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.5.2 - 2026-09-24
+### Fixed
+- Wait for chat restrictions to clear, including restrictions that remain after personal combat ends, before posting the queued leaderboard.
+- Preserve the current leaderboard line when a blocked send signals an error but returns normally, so retries do not lose the header or a winner line.
+- Retained direct chat API calls and the existing post-combat queue.
+
+### Validation
+- Added simulated active/activating chat restrictions and blocked-send retry coverage, alongside multi-client winner and throttle tests.
+
 ## 1.5.1 - 2026-09-02
 ### Fixed
 - Switched post-combat chat output to the current chat API, avoiding the deprecated global chat route while retaining the existing combat queue.

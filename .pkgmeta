@@ -10,6 +10,7 @@ ignore:
   - .idea
   - .DS_Store
   - tools
+  - tests
 
 # Use our own changelog instead of auto-generated one
 manual-changelog: CHANGELOG.MD
