@@ -1,8 +1,8 @@
-## Interface: 120100
+## Interface: 120105
 ## Title: JumpBoss
 ## Notes: Tracks jumps during boss encounters (addon users only). Silent comms. Winner posts leaderboard at end.
 ## Author: Karnytine-Stormrage (joe@tyreenet.com)
-## Version: 1.5.2
+## Version: 1.5.3
 ## SavedVariables: JumpBossDB
 
 JumpBoss.lua

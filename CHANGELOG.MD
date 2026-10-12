@@ -4,6 +4,10 @@ All notable changes to **JumpBoss** are documented in this file.
 
 ---
 
+## 1.5.3 - 2026-10-12
+### Changed
+- Updated addon interface metadata to Retail 12.1.5 (`## Interface: 120105`). No behavior changes.
+
 ## 1.5.2 - 2026-09-24
 ### Fixed
 - Wait for chat restrictions to clear, including restrictions that remain after personal combat ends, before posting the queued leaderboard.
